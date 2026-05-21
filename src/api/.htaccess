@@ -1,0 +1,15 @@
+# All API requests get rewritten to index.php
+# Format: api/<project>/<endpoint...> → index.php?path=<project>/<endpoint...>
+
+RewriteEngine On
+
+# Don't rewrite if the URL points to an existing file (e.g. for debugging)
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Send everything else to index.php
+RewriteRule ^(.*)$ index.php [QSA,L]
+
+# Make sure Apache passes the X-Agent-Secret header to PHP
+# (Some Apache configs strip non-standard headers by default)
+SetEnvIf X-Agent-Secret "(.*)" HTTP_X_AGENT_SECRET=$1

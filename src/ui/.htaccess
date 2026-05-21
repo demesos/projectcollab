@@ -1,0 +1,10 @@
+# ProjectCollab UI (multi-user)
+# HTTP Basic auth has been replaced with PHP session-based login.
+# Session check happens in each PHP file via lib.php's require_login().
+
+DirectoryIndex index.php
+
+# Block direct access to any helper files (shouldn't exist here, but defensive).
+<FilesMatch "^_">
+    Require all denied
+</FilesMatch>
