@@ -176,7 +176,27 @@ label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 500; }
     cursor: pointer;
     border-bottom: 2px solid transparent;
     border-radius: 0;
+    position: relative;
 }
+
+.tab-badge {
+    position: absolute;
+    top: 10px;
+    right: 8px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4caf50;
+    display: inline-block;
+}
+
+.nav-active {
+    color: var(--fg) !important;
+    font-weight: 600;
+}
+
+.skill-card { max-width: 760px; }
+.skill-code { background: var(--bg2); padding: 0.75rem 1rem; border-radius: 4px; overflow-x: auto; }
 
 .tabs button.active {
     color: var(--fg);
@@ -421,12 +441,11 @@ body.auth-page {
 .modal-card select { font: inherit; padding: 0.4rem 0.5rem; border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 4px; }
 
 /* --- About page --------------------------------------------------------- */
-#about-link {
+#projects-link, #skill-link, #about-link, #users-link {
     color: var(--fg-muted);
-    text-decoration: none;
     font-size: 0.95rem;
 }
-#about-link:hover { color: var(--accent); }
+#projects-link:hover, #skill-link:hover, #about-link:hover, #users-link:hover { color: var(--accent); }
 
 .about-card { max-width: 52rem; }
 .about-card h1 { margin-bottom: 0.25rem; }

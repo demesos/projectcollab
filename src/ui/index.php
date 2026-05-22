@@ -15,7 +15,12 @@ $siteName = (string) cfg_get('site_name', 'ProjectCollab');
 <header>
     <div class="header-inner">
         <a href="#" id="brand"><?= html_escape($siteName) ?></a>
+        <a href="#" id="projects-link" onclick="showList(); return false;">Projects</a>
+        <a href="#" id="skill-link" onclick="showSkill(); return false;">Skill</a>
         <a href="#" id="about-link" onclick="showAbout(); return false;">About</a>
+        <?php if ($user['role'] === 'admin'): ?>
+        <a href="#" id="users-link" onclick="showUsers(); return false;">Users</a>
+        <?php endif; ?>
         <nav id="breadcrumb"></nav>
         <div class="topbar-user">
             <span class="user-info">

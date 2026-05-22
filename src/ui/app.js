@@ -10,7 +10,7 @@ let state = {
     project: null,        // current project name
     projectOwner: null,   // email of project owner
     projectData: null,    // full project info from admin API
-    ownerSecret: null,    // for calling agent API
+    ownerSecret: null,    // kept for legacy; no longer sent to browser
     tab: 'files',
     mode: 'browse',       // 'browse' | 'editing' — blocks polling when editing
     pollTimer: null,
@@ -62,6 +62,39 @@ async function adminPost(action, body) {
     return data;
 }
 
+// uiApi: all human UI calls go through api.php (session-authenticated).
+// The browser never touches owner_secret.
+async function uiApi(action, options = {}) {
+    const url = new URL(ADMIN, location.href);
+    url.searchParams.set('action', action);
+    if (state.project)      url.searchParams.set('p', state.project);
+    if (state.projectOwner) url.searchParams.set('owner', state.projectOwner);
+    for (const [k, v] of Object.entries(options.params || {})) url.searchParams.set(k, v);
+
+    // Apache mod_userdir blocks PUT/DELETE — tunnel them as POST with override header
+    let method = options.method || 'GET';
+    const headers = { ...(options.headers || {}) };
+    if (method === 'PUT' || method === 'DELETE') {
+        headers['X-HTTP-Method-Override'] = method;
+        method = 'POST';
+    }
+
+    const res = await fetch(url, {
+        method,
+        headers,
+        body: options.body !== undefined ? options.body : undefined,
+    });
+    if (res.status === 204) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message || data.error || res.statusText);
+        return data;
+    }
+    return { raw: await res.arrayBuffer(), headers: res.headers };
+}
+
+// agentApi: kept only for news/presence polling (low-latency, no session overhead).
 async function agentApi(path, options = {}) {
     if (!state.ownerSecret) throw new Error('No owner secret available');
     const url = `${API}/${state.project}${path}`;
@@ -150,6 +183,13 @@ function setBreadcrumb(parts) {
     });
 }
 
+function setActiveNav(id) {
+    ['projects-link', 'skill-link', 'about-link', 'users-link'].forEach(lid => {
+        const e = document.getElementById(lid);
+        if (e) e.classList.toggle('nav-active', lid === id);
+    });
+}
+
 function setMode(mode) {
     state.mode = mode;
 }
@@ -180,6 +220,7 @@ async function refreshProjectView() {
     if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT')) return;
 
     try {
+        await pollNews();
         if (state.tab === 'chat') await refreshChat();
         else if (state.tab === 'agents') await refreshAgents();
         else if (state.tab === 'files') await refreshFiles();
@@ -232,7 +273,8 @@ async function showList() {
     setMode('browse');
     state.view = 'list';
     state.project = null;
-    setBreadcrumb([{ label: 'Projects' }]);
+    setActiveNav('projects-link');
+    setBreadcrumb([]);
 
     const app = document.getElementById('app');
     app.innerHTML = '';
@@ -245,9 +287,6 @@ async function showList() {
         app.appendChild(el('div', { class: 'row', style: 'margin-bottom: 1rem;' },
             el('button', { on: { click: showCreateProject } }, '+ New project'),
             el('button', { class: 'secondary', on: { click: () => showRestoreBackup(app) } }, '↩ Restore backup'),
-            (window.CURRENT_USER && window.CURRENT_USER.role === 'admin')
-                ? el('button', { class: 'secondary', style: 'margin-left: auto', on: { click: showUsers } }, '\u{1F465} Users')
-                : null,
         ));
 
         if (projects.length === 0) {
@@ -509,6 +548,7 @@ async function showProject(name, owner = null) {
         app.appendChild(el('div', { id: 'tab-content' }));
 
         renderTab();
+        pollNews();   // show badges immediately, don't wait for first poll tick
         startPolling();
     } catch (e) {
         app.innerHTML = '';
@@ -518,6 +558,7 @@ async function showProject(name, owner = null) {
 
 function tabBtn(key, label) {
     const btn = el('button', {
+        id: 'tab-btn-' + key,
         class: state.tab === key ? 'active' : '',
         on: { click: () => {
             setMode('browse');
@@ -528,6 +569,29 @@ function tabBtn(key, label) {
         }}
     }, label);
     return btn;
+}
+
+async function pollNews() {
+    if (!state.project) return;
+    try {
+        const news = await uiApi('news');
+        const fileTabUnread = news.files_list_unread ? 1 : 0;
+        const chatUnread = news.chat_unread || 0;
+        updateBadges({ files: fileTabUnread, chat: chatUnread });
+    } catch (e) { /* silent — badges are best-effort */ }
+}
+
+function updateBadges(counts) {
+    for (const [key, count] of Object.entries(counts)) {
+        const btn = document.getElementById('tab-btn-' + key);
+        if (!btn) continue;
+        // Remove old badge if present
+        const old = btn.querySelector('.tab-badge');
+        if (old) old.remove();
+        if (count > 0) {
+            btn.appendChild(el('span', { class: 'tab-badge' }));
+        }
+    }
 }
 
 function renderTab() {
@@ -551,10 +615,15 @@ async function renderFiles() {
 async function refreshFiles() {
     if (state.tab !== 'files' || state.mode === 'editing') return;
     try {
-        const { files } = await agentApi('/files');
+        const { files } = await uiApi('files');
         const pane = document.getElementById('tab-content');
         if (!pane) return;
         pane.innerHTML = '';
+
+        // Mark file list as seen — clears the tab dot independently of per-file read dots
+        uiApi('files-seen', { method: 'POST' }).catch(() => {});
+        const tabBtn = document.getElementById('tab-btn-files');
+        if (tabBtn) { const b = tabBtn.querySelector('.tab-badge'); if (b) b.remove(); }
 
         pane.appendChild(el('div', { class: 'row', style: 'margin-bottom: 1rem' },
             el('button', { on: { click: showCreateFile } }, '+ Create File'),
@@ -645,10 +714,8 @@ async function showFile(path) {
     pane.appendChild(el('div', { class: 'loading' }, 'Loading file…'));
 
     try {
-        const res = await fetch(`${API}/${state.project}/file?p=${encodeURIComponent(path)}`, {
-            headers: { 'X-Agent-Secret': state.ownerSecret },
-        });
-        const arrayBuf = await res.arrayBuffer();
+        const res = await uiApi('file', { params: { file: path } });
+        const arrayBuf = res.raw;
         const version = res.headers.get('X-File-Version');
         const modifiedBy = res.headers.get('X-File-Modified-By');
         const mime = res.headers.get('Content-Type') || '';
@@ -711,17 +778,12 @@ async function showFile(path) {
                 btnRow.appendChild(el('button', { on: { click: async () => {
                     try {
                         const content = document.getElementById('file-view-area').value;
-                        const r = await fetch(`${API}/${state.project}/file?p=${encodeURIComponent(path)}`, {
+                        const d = await uiApi('file', {
                             method: 'PUT',
-                            headers: {
-                                'X-Agent-Secret': state.ownerSecret,
-                                'X-Expected-Version': version,
-                                'Content-Type': 'text/plain',
-                            },
+                            params: { file: path },
+                            headers: { 'X-Expected-Version': version, 'Content-Type': 'text/plain' },
                             body: content,
                         });
-                        const d = await r.json();
-                        if (!r.ok) throw new Error(d.message || d.error);
                         setStatus(`Saved as v${d.version}`);
                         setMode('browse');
                         state.tab = 'files';
@@ -764,17 +826,11 @@ function hexDump(bytes) {
 async function deleteFile(path, version) {
     if (!confirm(`Delete ${path}?`)) return;
     try {
-        const res = await fetch(`${API}/${state.project}/file?p=${encodeURIComponent(path)}`, {
+        await uiApi('file', {
             method: 'DELETE',
-            headers: {
-                'X-Agent-Secret': state.ownerSecret,
-                'X-Expected-Version': String(version),
-            },
+            params: { file: path },
+            headers: { 'X-Expected-Version': String(version) },
         });
-        if (!res.ok) {
-            const d = await res.json();
-            throw new Error(d.message || d.error);
-        }
         setStatus(`Deleted ${path}`);
         refreshFiles();
     } catch (e) { setError(e.message); }
@@ -795,17 +851,12 @@ function showCreateFile() {
                 const path = document.getElementById('up-path').value.trim();
                 const content = document.getElementById('up-content').value;
                 if (!path) throw new Error('Path required');
-                const res = await fetch(`${API}/${state.project}/file?p=${encodeURIComponent(path)}`, {
+                const d = await uiApi('file', {
                     method: 'PUT',
-                    headers: {
-                        'X-Agent-Secret': state.ownerSecret,
-                        'X-New-File': 'true',
-                        'Content-Type': 'text/plain',
-                    },
+                    params: { file: path },
+                    headers: { 'X-New-File': 'true', 'Content-Type': 'text/plain' },
                     body: content,
                 });
-                const d = await res.json();
-                if (!res.ok) throw new Error(d.message || d.error);
                 setStatus(`Created ${path} at v${d.version}`);
                 setMode('browse');
                 state.tab = 'files';
@@ -838,17 +889,12 @@ function showUploadFile() {
                 if (!path) path = file.name;
                 statusDiv.textContent = 'Uploading…';
                 const arrayBuffer = await file.arrayBuffer();
-                const res = await fetch(`${API}/${state.project}/file?p=${encodeURIComponent(path)}`, {
+                const d = await uiApi('file', {
                     method: 'PUT',
-                    headers: {
-                        'X-Agent-Secret': state.ownerSecret,
-                        'X-New-File': 'true',
-                        'Content-Type': file.type || 'application/octet-stream',
-                    },
+                    params: { file: path },
+                    headers: { 'X-New-File': 'true', 'Content-Type': file.type || 'application/octet-stream' },
                     body: arrayBuffer,
                 });
-                const d = await res.json();
-                if (!res.ok) throw new Error(d.message || d.error);
                 statusDiv.textContent = '';
                 setStatus(`Uploaded ${path} (${d.size} bytes) at v${d.version}`);
                 setMode('browse');
@@ -869,9 +915,14 @@ async function renderChat() {
 async function refreshChat() {
     if (state.tab !== 'chat') return;
     try {
-        const { messages } = await agentApi('/chat?limit=200');
+        const { messages } = await uiApi('chat', { params: { limit: 200 } });
         const pane = document.getElementById('tab-content');
         if (!pane) return;
+
+        // Mark chat as seen — clears the tab badge
+        uiApi('chat-seen', { method: 'POST' }).catch(() => {});
+        const chatTabBtn = document.getElementById('tab-btn-chat');
+        if (chatTabBtn) { const b = chatTabBtn.querySelector('.tab-badge'); if (b) b.remove(); }
 
         // Preserve textarea content if polling re-renders while user is typing
         const oldInput = document.getElementById('chat-input');
@@ -896,7 +947,9 @@ async function refreshChat() {
         }
         pane.appendChild(box);
 
-        pane.appendChild(el('label', {}, `Post message (as ${window.CURRENT_USER ? window.CURRENT_USER.email.split('@')[0] : 'you'})`));
+        // Find the name the server will record (the agent whose secret we're using)
+        const postingAs = window.CURRENT_USER ? window.CURRENT_USER.email.split('@')[0] : 'you';
+        pane.appendChild(el('label', {}, `Post message (as ${postingAs})`));
         const ta = el('textarea', { rows: 3, id: 'chat-input' });
         ta.value = oldText;
         pane.appendChild(ta);
@@ -916,16 +969,11 @@ async function postChat() {
     const text = input.value.trim();
     if (!text) return;
     try {
-        const res = await fetch(`${API}/${state.project}/chat`, {
+        await uiApi('chat', {
             method: 'POST',
-            headers: {
-                'X-Agent-Secret': state.ownerSecret,
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text }),
         });
-        const d = await res.json();
-        if (!res.ok) throw new Error(d.message || d.error);
         input.value = '';
         refreshChat();
     } catch (e) { setError(e.message); }
@@ -940,8 +988,8 @@ async function renderAgents() {
 async function refreshAgents() {
     if (state.tab !== 'agents' || state.mode === 'editing') return;
     try {
-        const data = await adminGet('project', { p: state.project });
-        const presence = await agentApi('/presence');
+        const data = await adminGet('project', { p: state.project, owner: state.projectOwner });
+        const presence = await uiApi('presence');
 
         const pane = document.getElementById('tab-content');
         if (!pane) return;
@@ -962,11 +1010,11 @@ async function refreshAgents() {
             )),
             el('tbody', {}, ...data.agents.map(a =>
                 el('tr', {},
-                    el('td', {}, statusDot(a.last_seen)),
+                    el('td', {}, a.admin ? null : statusDot(a.last_seen)),
                     el('td', {}, el('strong', {}, a.name), a.admin ? el('span', { class: 'muted' }, ' (owner)') : null),
                     el('td', {}, a.role),
                     el('td', {}, el('span', { class: 'secret' }, a.secret), copyButton(a.secret)),
-                    el('td', { class: 'muted' }, fmtRelative(a.last_seen)),
+                    el('td', { class: 'muted' }, a.admin ? '—' : fmtRelative(a.last_seen)),
                     el('td', {},
                         a.admin ? null : el('button', {
                             class: 'danger',
@@ -1136,17 +1184,27 @@ async function renderShare() {
         pane.appendChild(el('h2', {}, 'Shared with'));
 
         const members = data.shared_with || [];
+
+        // Fetch user list for role display (admin only, best-effort)
+        let userRoles = {};
+        try {
+            const { users } = await adminGet('list-users');
+            users.forEach(u => { userRoles[u.email] = u.role; });
+        } catch (_) {}
+
         if (members.length === 0) {
             pane.appendChild(el('p', { class: 'muted' }, 'Not shared with anyone yet.'));
         } else {
             const table = el('table', {},
                 el('thead', {}, el('tr', {},
                     el('th', {}, 'User'),
+                    el('th', {}, 'Role'),
                     el('th', {}, ''),
                 )),
                 el('tbody', {}, ...members.map(email =>
                     el('tr', {},
                         el('td', {}, email),
+                        el('td', { class: 'muted' }, userRoles[email] || '—'),
                         el('td', {},
                             isOwner ? el('button', { class: 'danger', on: { click: async () => {
                                 if (!confirm(`Remove ${email} from this project?`)) return;
@@ -1231,10 +1289,8 @@ async function showUsers() {
     setMode('browse');
     state.view = 'users';
     state.project = null;
-    setBreadcrumb([
-        { label: 'Projects', onClick: showList },
-        { label: 'Users' },
-    ]);
+    setActiveNav('users-link');
+    setBreadcrumb([]);
 
     const app = document.getElementById('app');
     app.innerHTML = '';
@@ -1411,6 +1467,82 @@ Type the email address to confirm:`;
 }
 
 
+// --- Skill ---------------------------------------------------------------
+
+function showSkill() {
+    stopPolling();
+    setMode('browse');
+    state.view = 'skill';
+    state.project = null;
+    setActiveNav('skill-link');
+    setBreadcrumb([]);
+
+    const SKILL_URL = `${ADMIN}?action=skill-zip`;
+
+    const app = document.getElementById('app');
+    app.innerHTML = '';
+    app.appendChild(el('div', { class: 'card skill-card' },
+
+        el('h1', {}, 'ProjectCollab Skill'),
+
+        // What is a skill
+        el('p', {}, 'A skill is a bundle of Markdown instruction files that Claude reads at the start of a session to learn how to use a specific tool or system.'),
+
+        el('hr'),
+
+        // What is contained
+        el('h2', {}, 'What is in this skill'),
+        el('p', {}, 'The ProjectCollab skill contains:'),
+        el('ul', {},
+            el('li', {}, el('code', {}, 'SKILL.md'), ' — Core bootstrap flow, API endpoints, versioning protocol, and chat etiquette. Platform-agnostic.'),
+            el('li', {}, el('code', {}, 'platform-claudecode.md'), ' — Claude Code specifics: .collab secret file, Windows/WSL curl patterns, PowerShell build tools, binary upload paths.'),
+            el('li', {}, el('code', {}, 'platform-chat.md'), ' — claude.ai chat specifics: sandbox notes, skills path, memory system caveat.'),
+            el('li', {}, el('code', {}, 'references/api-spec.md'), ' — Full API specification (v0.2): all endpoints, request/response shapes, state machine, error codes.'),
+            el('li', {}, el('code', {}, 'references/curl-recipes.md'), ' — Copy-paste curl examples for every endpoint.'),
+        ),
+
+        el('hr'),
+
+        // How to use
+        el('h2', {}, 'How to use this skill'),
+        el('p', {}, 'Once installed, connect to a project by telling Claude:'),
+        el('pre', { class: 'skill-code' }, 'load your projectcollab skill, connect with secret <your-secret>'),
+        el('p', {}, 'Claude will read its platform file, call the API to discover its identity and project, read the project files and chat, introduce itself, and await instructions.'),
+        el('p', {}, 'The project name and agent identity are assigned by the server — you do not need to specify them. Each agent secret maps to a name, role, and set of skills defined in the project configuration.'),
+
+        el('hr'),
+
+        // How to install
+        el('h2', {}, 'How to install this skill'),
+
+        el('h3', {}, 'Claude.ai web chat'),
+        el('p', {},
+            'Download the skill file: ',
+            el('a', { href: SKILL_URL, download: '' }, '⬇ projectcollab.skill'),
+        ),
+        el('p', {}, 'Then copy the extracted files into the skills folder on the server where the chat sandbox mounts its skills:'),
+        el('pre', { class: 'skill-code' },
+`unzip projectcollab.skill -d /tmp/skill-extract\ncp -r /tmp/skill-extract/projectcollab /mnt/skills/user/projectcollab`),
+        el('p', { class: 'muted' }, 'The skill is active immediately — no restart required. Claude will read it on the next session when you ask it to load the projectcollab skill.'),
+
+        el('h3', {}, 'Claude Code'),
+        el('p', {},
+            'Download the skill file: ',
+            el('a', { href: SKILL_URL, download: '' }, '⬇ projectcollab.skill'),
+        ),
+        el('p', {}, 'Run in PowerShell:'),
+        el('pre', { class: 'skill-code' },
+`Expand-Archive projectcollab.skill -DestinationPath $HOME\\.claude\\skills\\ -Force`),
+        el('p', { class: 'muted' }, 'Installs to: ', el('code', {}, 'C:\\Users\\<you>\\.claude\\skills\\projectcollab\\')),
+        el('p', {}, 'Or on Linux/macOS:'),
+        el('pre', { class: 'skill-code' },
+`unzip projectcollab.skill -d ~/.claude/skills/`),
+
+        el('hr'),
+        el('p', { class: 'muted about-version' }, 'Skill format v1 · ProjectCollab 0.1'),
+    ));
+}
+
 // --- About ---------------------------------------------------------------
 
 function showAbout() {
@@ -1418,10 +1550,8 @@ function showAbout() {
     setMode('browse');
     state.view = 'about';
     state.project = null;
-    setBreadcrumb([
-        { label: 'Projects', onClick: showList },
-        { label: 'About' },
-    ]);
+    setActiveNav('about-link');
+    setBreadcrumb([]);
 
     const app = document.getElementById('app');
     app.innerHTML = '';

@@ -35,6 +35,10 @@ header('Content-Type: application/json; charset=utf-8');
 
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'];
+// Support method override for PUT/DELETE (blocked by Apache mod_userdir)
+if ($method === 'POST' && !empty($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE'])) {
+    $method = strtoupper($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']);
+}
 
 try {
     // All admin-API endpoints require a logged-in user.
@@ -63,6 +67,23 @@ try {
         case 'POST set-password':        setPassword($user, json_body()); break;
         case 'POST user-impact':         userImpact($user, json_body()); break;
         case 'GET whoami':               respond_json(200, ['email'=>$user['email'], 'role'=>$user['role']]); break;
+        case 'GET skill-zip':            downloadSkillZip(); break;
+
+        // --- File proxy (human UI acts as owner agent) ---
+        case 'GET files':                proxyGetFiles($user); break;
+        case 'POST files-seen':          proxyFilesSeen($user); break;
+        case 'GET file':                 proxyGetFile($user); break;
+        case 'PUT file':                 proxyPutFile($user); break;
+        case 'DELETE file':              proxyDeleteFile($user); break;
+
+        // --- Chat proxy (posts attributed to human display name) ---
+        case 'GET chat':                 proxyGetChat($user); break;
+        case 'POST chat-seen':           proxyChatSeen($user); break;
+        case 'POST chat':                proxyPostChat($user, json_body()); break;
+
+        // --- News/presence proxy ---
+        case 'GET news':                 proxyGetNews($user); break;
+        case 'GET presence':             proxyGetPresence($user); break;
 
         default:
             respond_json(404, ['error' => "Unknown action: $method $action"]);
@@ -133,10 +154,6 @@ function getProject(array $user): void {
             'last_seen' => $versions['last_seen'][$secret] ?? null,
         ];
     }
-    $ownerSecret = null;
-    foreach ($meta['agents'] ?? [] as $secret => $info) {
-        if (!empty($info['admin'])) { $ownerSecret = $secret; break; }
-    }
 
     respond_json(200, [
         'name'             => $project,
@@ -148,7 +165,6 @@ function getProject(array $user): void {
         'naming_scheme'    => $meta['naming_scheme'] ?? 'german',
         'shared_with'      => $meta['shared_with'] ?? [],
         'agents'           => $agents,
-        'owner_secret'     => $ownerSecret,
     ]);
 }
 
@@ -205,7 +221,7 @@ function createProject(array $user, array $body): void {
     writeWithPerms("$dir/chat.log", '', 0660);
     writeWithPerms("$dir/.lock", '', 0660);
 
-    respond_json(200, ['name' => $name, 'owner' => $owner, 'owner_secret' => $ownerSecret]);
+    respond_json(200, ['name' => $name, 'owner' => $owner]);
 }
 
 function deleteProject(array $user, array $body): void {
@@ -706,6 +722,302 @@ function restoreBackup(array $user): void {
             system('rm -rf ' . escapeshellarg($tmpDir) . ' 2>/dev/null');
         }
     }
+}
+
+// =============================================================================
+// AGENT API PROXY — direct filesystem implementation (no HTTP loopback)
+// =============================================================================
+
+function resolveProjectContext(array $user): array {
+    $project = (string) ($_GET['p'] ?? '');
+    $owner   = (string) ($_GET['owner'] ?? $user['email']);
+    requireProjectAccess($user, $owner, $project);
+    $dir  = project_dir($owner, $project);
+    $meta = jsonRead("$dir/meta.json") ?? [];
+    $ownerSecret = null;
+    foreach ($meta['agents'] ?? [] as $secret => $info) {
+        if (!empty($info['admin'])) { $ownerSecret = $secret; break; }
+    }
+    if (!$ownerSecret) respond_json(500, ['error' => 'No owner agent found']);
+    // Update owner agent last_seen on every human UI activity
+    touchLastSeen($dir, $ownerSecret);
+    return [$ownerSecret, $owner, $project, $dir, $meta];
+}
+
+function uiWithLock(string $dir, callable $fn) {
+    $fh = fopen("$dir/.lock", 'c');
+    if (!$fh || !flock($fh, LOCK_EX)) respond_json(500, ['error' => 'Lock failed']);
+    try { return $fn(); }
+    finally { flock($fh, LOCK_UN); fclose($fh); }
+}
+
+function readVersions(string $dir): array {
+    $v = jsonRead("$dir/versions.json") ?? [];
+    if (!isset($v['files']))     $v['files']     = [];
+    if (!isset($v['reads']))     $v['reads']     = [];
+    if (!isset($v['last_seen'])) $v['last_seen'] = [];
+    return $v;
+}
+
+function writeVersions(string $dir, array $v): void {
+    writeWithPerms("$dir/versions.json", json_encode($v, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+}
+
+function validateFilePath(string $path): string {
+    $path = ltrim(str_replace('\\', '/', $path), '/');
+    if ($path === '' || strpos($path, '..') !== false || strpos($path, "\0") !== false) {
+        respond_json(400, ['error' => 'Invalid file path']);
+    }
+    return $path;
+}
+
+function touchLastSeen(string $dir, string $secret): void {
+    // Best-effort, no lock — just a timestamp update, losing one occasionally is fine.
+    $v = readVersions($dir);
+    $v['last_seen'][$secret] = now_iso();
+    writeVersions($dir, $v);
+}
+
+// GET ?action=files
+function proxyGetFiles(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $versions = readVersions($dir);
+    // Update last_seen
+    uiWithLock($dir, function() use ($dir, $secret, &$versions) {
+        $versions = readVersions($dir);
+        $versions['last_seen'][$secret] = now_iso();
+        writeVersions($dir, $versions);
+    });
+    $out = [];
+    foreach ($versions['files'] as $path => $info) {
+        $entry = [
+            'path'        => $path,
+            'version'     => $info['version'],
+            'state'       => $info['state'] ?? 'active',
+            'modified'    => $info['modified'] ?? null,
+            'modified_by' => $info['modified_by'] ?? null,
+            'size'        => $info['size'] ?? null,
+        ];
+        if (($entry['state'] === 'active') && (($entry['size'] ?? 0) === 0)) {
+            $abs = "$dir/files/$path";
+            if (is_file($abs)) { $fsz = filesize($abs); if ($fsz !== false && $fsz > 0) $entry['size'] = $fsz; }
+        }
+        if (isset($info['deleted_at']))  $entry['deleted_at']  = $info['deleted_at'];
+        if (isset($info['deleted_by']))  $entry['deleted_by']  = $info['deleted_by'];
+        $out[] = $entry;
+    }
+    respond_json(200, ['files' => $out]);
+}
+
+// POST ?action=files-seen
+function proxyFilesSeen(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $userKey = $user['email'];
+    uiWithLock($dir, function() use ($dir, $userKey) {
+        $v = readVersions($dir);
+        $v['files_list_seen'][$userKey] = now_iso();
+        writeVersions($dir, $v);
+    });
+    respond_json(200, ['ok' => true]);
+}
+
+// GET ?action=file&file=path
+function proxyGetFile(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $relPath = validateFilePath((string)($_GET['file'] ?? ''));
+    $versions = readVersions($dir);
+    $info = $versions['files'][$relPath] ?? null;
+    if (!$info || ($info['state'] ?? 'active') === 'deleted') respond_json(404, ['error' => 'not_found']);
+    $absPath = "$dir/files/$relPath";
+    if (!is_file($absPath)) respond_json(404, ['error' => 'not_found']);
+    // Mark as read
+    uiWithLock($dir, function() use ($dir, $secret, $relPath, $info) {
+        $v = readVersions($dir);
+        $v['reads'][$secret][$relPath] = $info['version'];
+        writeVersions($dir, $v);
+    });
+    header('X-File-Version: ' . $info['version']);
+    header('X-File-Modified-By: ' . ($info['modified_by'] ?? ''));
+    header('Content-Type: ' . ($info['mime'] ?? 'application/octet-stream'));
+    readfile($absPath);
+    exit;
+}
+
+// PUT ?action=file&file=path
+function proxyPutFile(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $relPath     = validateFilePath((string)($_GET['file'] ?? ''));
+    $isNewFile   = !empty($_SERVER['HTTP_X_NEW_FILE']);
+    $expectedVer = isset($_SERVER['HTTP_X_EXPECTED_VERSION']) ? (int)$_SERVER['HTTP_X_EXPECTED_VERSION'] : null;
+    $mime        = $_SERVER['CONTENT_TYPE'] ?? 'application/octet-stream';
+    $body        = (string) file_get_contents('php://input');
+    $bodyLen     = strlen($body);
+    $displayName = strstr($user['email'], '@', true) ?: $user['email'];
+
+    uiWithLock($dir, function() use ($dir, $secret, $relPath, $isNewFile, $expectedVer, $mime, $body, $bodyLen, $displayName) {
+        $v    = readVersions($dir);
+        $info = $v['files'][$relPath] ?? null;
+        $now  = now_iso();
+
+        if ($isNewFile) {
+            if ($info && ($info['state'] ?? 'active') === 'active') {
+                respond_json(409, ['error' => 'file_exists', 'message' => 'File already exists.']);
+            }
+            $newVersion = $info ? $info['version'] + 1 : 1;
+        } else {
+            if (!$info) respond_json(404, ['error' => 'not_found']);
+            $claimed = $expectedVer ?? ($v['reads'][$secret][$relPath] ?? null);
+            if ($claimed === null) respond_json(400, ['error' => 'bad_request', 'message' => 'Provide X-Expected-Version']);
+            if ($claimed !== $info['version']) respond_json(409, ['error' => 'version_conflict', 'message' => "Conflict: current v{$info['version']}, you have v$claimed"]);
+            $newVersion = $info['version'] + 1;
+        }
+
+        $absPath = "$dir/files/$relPath";
+        $dirPath = dirname($absPath);
+        if (!is_dir($dirPath)) mkdir($dirPath, 0770, true);
+        $tmp = "$absPath.tmp." . getmypid();
+        file_put_contents($tmp, $body);
+        rename($tmp, $absPath);
+        $size = filesize($absPath) ?: $bodyLen;
+
+        $v['files'][$relPath] = ['version' => $newVersion, 'state' => 'active', 'modified' => $now, 'modified_by' => $displayName, 'size' => $size, 'mime' => $mime];
+        $v['reads'][$secret][$relPath] = $newVersion;
+        writeVersions($dir, $v);
+
+        respond_json(200, ['path' => $relPath, 'version' => $newVersion, 'previous_version' => $info['version'] ?? 0, 'size' => $size, 'body_received' => $bodyLen, 'modified' => $now, 'written_by' => $displayName]);
+    });
+}
+
+// DELETE ?action=file&file=path
+function proxyDeleteFile(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $relPath     = validateFilePath((string)($_GET['file'] ?? ''));
+    $expectedVer = isset($_SERVER['HTTP_X_EXPECTED_VERSION']) ? (int)$_SERVER['HTTP_X_EXPECTED_VERSION'] : null;
+    uiWithLock($dir, function() use ($dir, $secret, $relPath, $expectedVer) {
+        $v    = readVersions($dir);
+        $info = $v['files'][$relPath] ?? null;
+        if (!$info || ($info['state'] ?? 'active') === 'deleted') respond_json(404, ['error' => 'not_found']);
+        $claimed = $expectedVer ?? ($v['reads'][$secret][$relPath] ?? null);
+        if ($claimed !== null && $claimed !== $info['version']) respond_json(409, ['error' => 'version_conflict']);
+        $now = now_iso();
+        $v['files'][$relPath]['state']      = 'deleted';
+        $v['files'][$relPath]['deleted_at'] = $now;
+        $v['files'][$relPath]['deleted_by'] = $secret;
+        writeVersions($dir, $v);
+        respond_json(200, ['path' => $relPath, 'state' => 'deleted', 'deleted_at' => $now]);
+    });
+}
+
+// GET ?action=chat
+function proxyGetChat(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $limit    = max(1, min(500, (int)($_GET['limit'] ?? 50)));
+    $chatPath = "$dir/chat.log";
+    $messages = [];
+    if (is_file($chatPath)) {
+        $lines = file($chatPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        foreach ($lines as $line) {
+            $m = json_decode($line, true);
+            if (is_array($m)) $messages[] = $m;
+        }
+    }
+    $messages = array_slice($messages, -$limit);
+    respond_json(200, ['messages' => $messages]);
+}
+
+// POST ?action=chat-seen
+function proxyChatSeen(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $userKey = $user['email'];
+    uiWithLock($dir, function() use ($dir, $userKey) {
+        $v = readVersions($dir);
+        $v['chat_seen'][$userKey] = now_iso();
+        writeVersions($dir, $v);
+    });
+    respond_json(200, ['ok' => true]);
+}
+
+// POST ?action=chat  (human post — attributed to email local-part)
+function proxyPostChat(array $user, array $body): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $displayName = strstr($user['email'], '@', true) ?: $user['email'];
+    $text = trim((string)($body['text'] ?? ''));
+    if ($text === '') respond_json(400, ['error' => 'text must not be empty']);
+    $chatPath = "$dir/chat.log";
+    $msg = null;
+    uiWithLock($dir, function() use ($chatPath, $displayName, $text, &$msg) {
+        $id = 1;
+        if (is_file($chatPath)) {
+            $lines = file($chatPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            foreach ($lines as $l) { $m = json_decode($l, true); if (is_array($m) && isset($m['id'])) $id = max($id, (int)$m['id'] + 1); }
+        }
+        $msg = ['id' => $id, 'time' => now_iso(), 'from' => $displayName, 'text' => $text];
+        file_put_contents($chatPath, json_encode($msg, JSON_UNESCAPED_SLASHES) . "\n", FILE_APPEND);
+    });
+    respond_json(200, ['id' => $msg['id'], 'time' => $msg['time'], 'from' => $msg['from']]);
+}
+
+// GET ?action=news
+function proxyGetNews(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $userKey = $user['email'];
+    $v = readVersions($dir);
+
+    // files_list_unread: true only if new/changed files appeared since user last viewed the list
+    $filesListSeen = $v['files_list_seen'][$userKey] ?? '1970-01-01T00:00:00Z';
+    $latestFile = '1970-01-01T00:00:00Z';
+    foreach ($v['files'] as $info) {
+        if (($info['modified'] ?? '') > $latestFile) $latestFile = $info['modified'];
+    }
+    $filesListUnread = $latestFile > $filesListSeen;
+
+    // chat_unread: count messages since this user last saw the chat
+    $chatSeen = $v['chat_seen'][$userKey] ?? null;
+    $chatUnread = 0;
+    $chatPath = "$dir/chat.log";
+    if (is_file($chatPath)) {
+        $lines = file($chatPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        foreach ($lines as $l) {
+            $m = json_decode($l, true);
+            if (is_array($m) && isset($m['time']) && ($chatSeen === null || $m['time'] > $chatSeen)) $chatUnread++;
+        }
+    }
+    respond_json(200, ['files_list_unread' => $filesListUnread, 'chat_unread' => $chatUnread, 'files_unchanged' => count($v['files']), 'as_of' => now_iso()]);
+}
+
+// GET ?action=presence
+function proxyGetPresence(array $user): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    $v    = readVersions($dir);
+    $meta = jsonRead("$dir/meta.json") ?? [];
+    $out  = [];
+    foreach ($meta['agents'] ?? [] as $s => $info) {
+        $out[] = ['name' => $info['name'] ?? '', 'role' => $info['role'] ?? '', 'last_seen' => $v['last_seen'][$s] ?? null];
+    }
+    respond_json(200, ['agents' => $out]);
+}
+
+function downloadSkillZip(): void {
+    $skillDir = '/home/collab/data/skill';
+    if (!is_dir($skillDir)) respond_json(404, ['error' => 'Skill files not found on server']);
+
+    $zipFile = tempnam(sys_get_temp_dir(), 'skill_') . '.zip';
+    $zip = new ZipArchive();
+    if ($zip->open($zipFile, ZipArchive::CREATE) !== true) respond_json(500, ['error' => 'Could not create zip']);
+
+    $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($skillDir, FilesystemIterator::SKIP_DOTS));
+    foreach ($iter as $file) {
+        $rel = 'projectcollab/' . substr($file->getPathname(), strlen($skillDir) + 1);
+        $zip->addFile($file->getPathname(), $rel);
+    }
+    $zip->close();
+
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="projectcollab.skill"');
+    header('Content-Length: ' . filesize($zipFile));
+    readfile($zipFile);
+    unlink($zipFile);
+    exit;
 }
 
 // =============================================================================

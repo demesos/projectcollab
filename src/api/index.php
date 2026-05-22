@@ -87,6 +87,7 @@ switch ($route) {
     case 'GET chat':            handleGetChat($projectDir, $agent); break;
     case 'POST chat':           handlePostChat($projectDir, $agent); break;
     case 'POST chat/seen':      handleChatSeen($projectDir, $agent); break;
+    case 'POST files/seen':     handleFilesSeen($projectDir, $agent); break;
     case 'GET presence':        handlePresence($projectDir, $meta); break;
     default:
         respond(404, ['error' => 'not_found', 'message' => "No route: $route"]);
@@ -182,13 +183,25 @@ function handleNews(string $projectDir, array $agent): void {
 
         $chatUnread = countUnreadChat($projectDir, $versions, $agent['secret']);
 
+        // files_list_unread: true if any file was modified after the agent last viewed the file list
+        $filesListSeen = $versions['files_list_seen'][$agent['secret']] ?? '1970-01-01T00:00:00Z';
+        $filesListUnread = false;
+        foreach ($files as $path => $info) {
+            $modified = $info['modified'] ?? '1970-01-01T00:00:00Z';
+            if ($modified > $filesListSeen) {
+                $filesListUnread = true;
+                break;
+            }
+        }
+
         respond(200, [
-            'files_added'     => $added,
-            'files_updated'   => $updated,
-            'files_deleted'   => $deleted,
-            'files_unchanged' => $unchanged,
-            'chat_unread'     => $chatUnread,
-            'as_of'           => nowIso(),
+            'files_added'       => $added,
+            'files_updated'     => $updated,
+            'files_deleted'     => $deleted,
+            'files_unchanged'   => $unchanged,
+            'files_list_unread' => $filesListUnread,
+            'chat_unread'       => $chatUnread,
+            'as_of'             => nowIso(),
         ]);
     });
 }
@@ -540,6 +553,16 @@ function handleChatSeen(string $projectDir, array $agent): void {
         $versions['last_seen'][$agent['secret']] = $now;
         writeVersions($projectDir, $versions);
         respond(200, ['last_seen' => $now]);
+    });
+}
+
+function handleFilesSeen(string $projectDir, array $agent): void {
+    withLock($projectDir, function() use ($projectDir, $agent) {
+        $versions = readVersions($projectDir);
+        $now = nowIso();
+        $versions['files_list_seen'][$agent['secret']] = $now;
+        writeVersions($projectDir, $versions);
+        respond(200, ['files_list_seen' => $now]);
     });
 }
 
