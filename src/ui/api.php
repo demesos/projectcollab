@@ -67,7 +67,6 @@ try {
         case 'POST set-password':        setPassword($user, json_body()); break;
         case 'POST user-impact':         userImpact($user, json_body()); break;
         case 'GET whoami':               respond_json(200, ['email'=>$user['email'], 'role'=>$user['role']]); break;
-        case 'GET skill-zip':            downloadSkillZip(); break;
 
         // --- File proxy (human UI acts as owner agent) ---
         case 'GET files':                proxyGetFiles($user); break;
@@ -995,29 +994,6 @@ function proxyGetPresence(array $user): void {
         $out[] = ['name' => $info['name'] ?? '', 'role' => $info['role'] ?? '', 'last_seen' => $v['last_seen'][$s] ?? null];
     }
     respond_json(200, ['agents' => $out]);
-}
-
-function downloadSkillZip(): void {
-    $skillDir = '/home/collab/data/skill';
-    if (!is_dir($skillDir)) respond_json(404, ['error' => 'Skill files not found on server']);
-
-    $zipFile = tempnam(sys_get_temp_dir(), 'skill_') . '.zip';
-    $zip = new ZipArchive();
-    if ($zip->open($zipFile, ZipArchive::CREATE) !== true) respond_json(500, ['error' => 'Could not create zip']);
-
-    $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($skillDir, FilesystemIterator::SKIP_DOTS));
-    foreach ($iter as $file) {
-        $rel = 'projectcollab/' . substr($file->getPathname(), strlen($skillDir) + 1);
-        $zip->addFile($file->getPathname(), $rel);
-    }
-    $zip->close();
-
-    header('Content-Type: application/zip');
-    header('Content-Disposition: attachment; filename="projectcollab.skill"');
-    header('Content-Length: ' . filesize($zipFile));
-    readfile($zipFile);
-    unlink($zipFile);
-    exit;
 }
 
 // =============================================================================

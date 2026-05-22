@@ -1,8 +1,7 @@
 // ProjectCollab — Single Page App
 // Vanilla JS, no dependencies.
 
-const API = '../api';           // agent API base
-const ADMIN = 'api.php';        // admin API base
+const ADMIN = 'api.php';        // human UI API
 const POLL_INTERVAL = 5000;     // 5s
 
 let state = {
@@ -10,7 +9,6 @@ let state = {
     project: null,        // current project name
     projectOwner: null,   // email of project owner
     projectData: null,    // full project info from admin API
-    ownerSecret: null,    // kept for legacy; no longer sent to browser
     tab: 'files',
     mode: 'browse',       // 'browse' | 'editing' — blocks polling when editing
     pollTimer: null,
@@ -84,22 +82,6 @@ async function uiApi(action, options = {}) {
         headers,
         body: options.body !== undefined ? options.body : undefined,
     });
-    if (res.status === 204) return null;
-    const ct = res.headers.get('content-type') || '';
-    if (ct.includes('application/json')) {
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.message || data.error || res.statusText);
-        return data;
-    }
-    return { raw: await res.arrayBuffer(), headers: res.headers };
-}
-
-// agentApi: kept only for news/presence polling (low-latency, no session overhead).
-async function agentApi(path, options = {}) {
-    if (!state.ownerSecret) throw new Error('No owner secret available');
-    const url = `${API}/${state.project}${path}`;
-    const headers = { 'X-Agent-Secret': state.ownerSecret, ...(options.headers || {}) };
-    const res = await fetch(url, { ...options, headers });
     if (res.status === 204) return null;
     const ct = res.headers.get('content-type') || '';
     if (ct.includes('application/json')) {
@@ -531,7 +513,6 @@ async function showProject(name, owner = null) {
         const data = await adminGet('project', { p: name, owner: state.projectOwner });
         state.projectData = data;
         state.projectOwner = data.owner || state.projectOwner;
-        state.ownerSecret = data.owner_secret;
 
         app.innerHTML = '';
         app.appendChild(el('h1', {}, data.display_name));
@@ -1477,7 +1458,7 @@ function showSkill() {
     setActiveNav('skill-link');
     setBreadcrumb([]);
 
-    const SKILL_URL = `${ADMIN}?action=skill-zip`;
+    const SKILL_URL = 'projectcollab.skill';
 
     const app = document.getElementById('app');
     app.innerHTML = '';
