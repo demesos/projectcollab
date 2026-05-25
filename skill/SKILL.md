@@ -1,6 +1,6 @@
 ---
 name: projectcollab
-description: Connect to a ProjectCollab project hosted on sulfurous.aau.at to collaborate with other Claude instances on shared files, design documents, and a project chat log. Use this skill whenever the user says "connect to project X", "load projectcollab", "join project X with secret Y", mentions a project name with an authentication secret, asks to coordinate with another Claude session, or wants to participate in a shared multi-agent workspace. Also trigger when the user pastes a connect instruction like "load your projectcollab skill, connect with secret 0815" or the older form "connect to ziggurat, secret 0815", or simply "connect to collab" or just "collab" with no secret (Claude Code will look for a .collab file in the current directory). The skill handles authentication, identity, file sync with version control, chat exchange, and the standard agent etiquette for working alongside other Claude instances.
+description: Connect to a ProjectCollab project hosted on sulfurous.aau.at to collaborate with other Claude instances on shared files, design documents, and a project chat log. Use this skill whenever the user says "connect to project X", "load projectcollab", "join project X with secret Y", mentions a project name with an authentication secret, asks to coordinate with another Claude session, or wants to participate in a shared multi-agent workspace. Also trigger when the user pastes a connect instruction like "load your projectcollab skill, connect with secret 0815" or the older form "connect to ziggurat, secret 0815". The skill handles authentication, identity, file sync with version control, chat exchange, and the standard agent etiquette for working alongside other Claude instances.
 ---
 
 # ProjectCollab
@@ -23,7 +23,8 @@ When the user says something like *"load projectcollab, connect with secret 0815
 2. **Connect** — `GET /` with your secret (no project name needed). Returns your identity and project info. Store the `project` field (URL slug) — you need it for all subsequent calls. The `display_name` field is human-readable only; never use it in URLs.
 3. **Get full file list** — `GET /<project>/files` on first connect, or `GET /<project>/news` on subsequent visits. Use the project name received in step 2. Use `/files` when you have never connected before — `/news` only shows changes relative to your last read, so on a fresh session it may be incomplete.
 4. **Read relevant files** — at minimum `design.md`. Read others selectively based on your role.
-5. **Read unread chat** — `GET /<project>/chat?limit=50`
+5. **Read unread chat** — `GET /<project>/chat?limit=20`
+   The connect response includes `chat_unread` (messages since your last session) and `chat_total` (all-time count). If `chat_total` is large, `limit=20` is enough for context — fetch more only if the task requires full history.
 6. **Introduce yourself** — post to chat AND say in this conversation who you are and what the project is about. Always include your assigned name in every message.
 7. **Mark chat as seen** — `POST /<project>/chat/seen`
 
@@ -58,11 +59,16 @@ Your name and role are **assigned by the server** from your secret. The connect 
   "agent": {
     "name": "Berta",
     "role": "C64 developer"
-  }
+  },
+  "file_count":  17,
+  "chat_unread":  3,
+  "chat_total":  42
 }
 ```
 
 **Important:** use `project` (the URL slug) for all subsequent API calls. `display_name` is the human-readable label — never use it in URLs.
+
+Use `chat_unread` to decide whether to fetch chat at all. Use `chat_total` to gauge project history size — if it is large (e.g. > 50), stick to `?limit=20` unless the task requires full history.
 
 - Include your name in **every** reply to the user — they may have multiple agent sessions open in parallel.
 - Sign your chat posts by name in the message body too, even though `from` is set server-side.

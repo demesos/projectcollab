@@ -74,6 +74,13 @@ $meta       = $resolved['meta'];
 $agent = $meta['agents'][$secret];
 $agent['secret'] = $secret;
 
+// Update last_seen on every authenticated request.
+withLock($projectDir, function() use ($projectDir, $secret) {
+    $v = readVersions($projectDir);
+    $v['last_seen'][$secret] = nowIso();
+    writeVersions($projectDir, $v);
+});
+
 $method = $_SERVER['REQUEST_METHOD'];
 $route = "$method $endpoint" . ($sub ? "/$sub" : '');
 
@@ -106,6 +113,7 @@ function handleConnect(string $projectDir, array $meta, array $agent, string $pr
             if (($f['state'] ?? 'active') === 'active') $fileCount++;
         }
         $chatUnread = countUnreadChat($projectDir, $versions, $agent['secret']);
+        $chatTotal  = countTotalChat($projectDir);
 
         respond(200, [
             'project'      => $project,          // URL slug — use this in all subsequent calls
@@ -115,6 +123,7 @@ function handleConnect(string $projectDir, array $meta, array $agent, string $pr
             'design_doc'   => 'design.md',
             'file_count'   => $fileCount,
             'chat_unread'  => $chatUnread,
+            'chat_total'   => $chatTotal,
             'server_time'  => nowIso(),
         ]);
     });
@@ -647,6 +656,19 @@ function countUnreadChat(string $projectDir, array $versions, string $secret): i
         if (is_array($msg) && isset($msg['time']) && $msg['time'] > $lastSeen) {
             $count++;
         }
+    }
+    fclose($fh);
+    return $count;
+}
+
+function countTotalChat(string $projectDir): int {
+    $chatPath = $projectDir . '/chat.log';
+    if (!file_exists($chatPath)) return 0;
+    $count = 0;
+    $fh = fopen($chatPath, 'r');
+    if (!$fh) return 0;
+    while (($line = fgets($fh)) !== false) {
+        if (trim($line) !== '') $count++;
     }
     fclose($fh);
     return $count;

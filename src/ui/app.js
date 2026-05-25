@@ -172,6 +172,10 @@ function setActiveNav(id) {
     });
 }
 
+function setTitle(sub) {
+    document.title = sub ? `ProjectCollab \u2013 ${sub}` : 'ProjectCollab';
+}
+
 function setMode(mode) {
     state.mode = mode;
 }
@@ -256,6 +260,7 @@ async function showList() {
     state.view = 'list';
     state.project = null;
     setActiveNav('projects-link');
+    setTitle(null);
     setBreadcrumb([]);
 
     const app = document.getElementById('app');
@@ -430,8 +435,8 @@ async function showCreateProject() {
         { label: 'New project' },
     ]);
 
-    const slugInput = el('input', { type: 'text', id: 'p-name', placeholder: 'ziggurat' });
-    const displayInput = el('input', { type: 'text', id: 'p-display', placeholder: 'Ziggurat' });
+    const slugInput = el('input', { type: 'text', id: 'p-name', placeholder: 'my-project' });
+    const displayInput = el('input', { type: 'text', id: 'p-display', placeholder: 'My Project' });
 
     // Copy slug → display name suggestion as user types, only if display not manually edited
     let displayEdited = false;
@@ -442,13 +447,25 @@ async function showCreateProject() {
             const slug = slugInput.value;
             displayInput.value = slug.charAt(0).toUpperCase() + slug.slice(1);
         }
+        // Live slug validation
+        const val = slugInput.value;
+        const slugError = document.getElementById('p-name-error');
+        if (slugError) {
+            if (val && !/^[a-z0-9_-]+$/.test(val)) {
+                slugError.textContent = 'Only lowercase letters (a-z), digits, dash (-), and underscore (_) are allowed. No spaces or special characters.';
+                slugError.style.display = '';
+            } else {
+                slugError.style.display = 'none';
+            }
+        }
     });
 
     const card = el('div', { class: 'card' },
         el('h1', {}, 'Create project'),
         el('label', {}, 'Name (URL slug)'),
         slugInput,
-        el('div', { class: 'muted' }, 'Lowercase letters, digits, dash, underscore'),
+        el('div', { class: 'muted' }, 'Lowercase letters, digits, dash, underscore — no spaces'),
+        el('div', { id: 'p-name-error', class: 'muted', style: 'color: var(--danger); display: none; margin-top: 0.25rem' }),
         el('label', {}, 'Display name'),
         displayInput,
         el('label', {}, 'Description'),
@@ -475,7 +492,8 @@ async function showCreateProject() {
             el('button', { on: { click: async () => {
                 try {
                     const name = document.getElementById('p-name').value.trim();
-                    if (!name) throw new Error('Slug required');
+                    if (!name) throw new Error('Project slug is required');
+                    if (!/^[a-z0-9_-]+$/.test(name)) throw new Error('Invalid slug: use only lowercase letters, digits, dash (-), and underscore (_). No spaces or special characters.');
                     const display_name = document.getElementById('p-display').value.trim() || name;
                     const description = document.getElementById('p-desc').value.trim();
                     const naming_scheme = document.getElementById('p-scheme').value;
@@ -500,6 +518,7 @@ async function showProject(name, owner = null) {
     state.project = name;
     state.projectOwner = owner || (window.CURRENT_USER && window.CURRENT_USER.email);
     state.tab = 'files';
+    setTitle(name);
     setBreadcrumb([
         { label: 'Projects', onClick: showList },
         { label: name },
@@ -513,6 +532,7 @@ async function showProject(name, owner = null) {
         const data = await adminGet('project', { p: name, owner: state.projectOwner });
         state.projectData = data;
         state.projectOwner = data.owner || state.projectOwner;
+        setTitle(data.display_name);
 
         app.innerHTML = '';
         app.appendChild(el('h1', {}, data.display_name));
@@ -631,7 +651,10 @@ async function refreshFiles() {
             el('td', { class: 'muted' }, f.modified_by || '—'),
             el('td', {},
                 f.state === 'active'
-                    ? el('button', { class: 'danger', on: { click: () => deleteFile(f.path, f.version) }}, 'delete')
+                    ? el('span', { class: 'row', style: 'gap: 0.25rem; flex-wrap: nowrap' },
+                        el('button', { class: 'secondary', title: 'Download', on: { click: () => downloadFile(f.path) }}, el('img', { src: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEoAAABKCAYAAAAc0MJxAAAFIklEQVR4nO2cvU7zPBiGb9tpgBbKUhhAApYKlVMoCwssbBWHwcJZsHAUDAxsdGFATBwCExJigxE1gBChub+Bz3ndQoKbpiQgX5LVqM2Pn6uPU9d2K0jC8T2y6Ar8FpwoSwoRpZt7t9vl6uoqPc+jUopSSgohKISglJJKKXqex9XVVXa7XZrHFlLpIsrb2xuazSYBUClFIQQBDBQhBJVSBMBms8m3t7fC6ltY03t9fcXDwwOEEIiiCCQhhIhfF0KAJKIoghACDw8PeH19Laq6xYkSQkBKGQvSYjTDz0spB0T+NKW5mX917ylT16UwUbrt6+20/Yb3L4LSZFTZcaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIsmYgom0kAz/Pi6ae0aShzH8/zcrl2Fr6/cgaEEOj3+3h5eUnc5+npaeRZmMfHR7y/vyfuW61WoZTKWOt0RJ7vgJ60vLy85MHBAe7u7uLnh69DMpY1PPk5UMH/XxNCYHZ29lP26UlSAFhbW8PR0RG2trbE8MxzLsHlWcIwRKvV+rSO4KdKq9ViGIa5x5V709OZoZSKm+B3+9tmVBpKKaumnJk8revFFqenpwRAz/MopYxXpiDn7NHnlFLS8zwC4OnpKc265FVyT1FdwcPDw1iWDihPWeY5taTDw8OJSJqIKJLo9/sgif39fQJgpVLJVZZ5rkqlQgDc39+nee1fIUpXOIoidDqdXGV9JanT6TCKoolJmqgonf5PT09ot9sDsnTJIkkXLandblN3MybR5CYuyqz4/f39wDJEM+hRJZnnaDabvL+/n7ikiYsi/90zrq+vsbCwMBBolqKPXVhY4PX19cA1frUoknh/fwdJXFxccHp6Ol7xa3u/MjNJSsmZmRleXFzQPPefEGUGdHx8HHcbbPpYX/WVjo+Pf1TSj4oyA7PtY6X1lX5S0o+LIu37WEX0lUolSgea1scqqq+UVlKHWcwxo2H0sEcWyI8vuc/Pz9jZ2eHV1RUqlcqnsSbP8xCGIdrtNs7Pz0WtVouPzcJY8SQZDIIAS0tLrNfrnJ+fZ71eH9heXl5mEASZ36G0Ppa5nVdfKQgCLC8vJ8aztLSUGk/iC71eD9VqNfHTqFarsdfrjd0EyX99LN3UdFPMs6/U6/VQq9US46lWq6nxJI6Z6zFq/VMMPZKot80x76xIKdHv97GxsYGTkxP4vo8wDBGGIXzfx8nJCTY2NtDv9yHleMP7Y8eT9g7Mzc0lfhrV6/WxM2o4s87Ozri+vs5Wq8Vut8s8MsmMp16vJ8YzNzeXGs9EJhdGRf94aHd3V2xvb0MIgUql8pHyY2ZSXpRCFID452i+7wMAoigqjSSgZBOgppgySQJKJqrMOFGWOFGWjCxq1LUAZcF2rUPi8aMeQDJ+/G4tQJmwXeuQROaUCIIA6+vrLPIH0aNAfkx0ZCVRlLn4wZzyNh+DIMh84SIxM8qcsk9700fOKNu1AGVF133U5pcoKh5eGDr5OO28LOi6D7eUtJgSP/WmpqbQaDQgpRz4I4e/gvnHE1JKNBoNTE1NJe7/pSiS8H0fm5ubiKIISqlP/3rxWxn+dw6lFKIoQrvdhu/7yVn11ZCCHkm8vb3FysrKpyGJv1DMWFZWVnh7ezsQ+3D5dhzn5uYGe3t7XFxcHGvdQFmKGcPi4iL39vZ4c3PzrYdc13D+Zdx3PUucKEucKEucKEucKEucKEv+A97GN/uTECooAAAAAElFTkSuQmCC', class: 'dl-icon', alt: 'download', style: 'width:14px;height:14px;vertical-align:middle' })),
+                        el('button', { class: 'danger', on: { click: () => deleteFile(f.path, f.version) }}, 'delete')
+                    )
                     : el('span', { class: 'muted' }, 'deleted')
             )
         );
@@ -748,6 +771,13 @@ async function showFile(path) {
             });
         }
         pane.appendChild(toggleBtn);
+        const dlBtn = el('button', {
+            class: 'secondary',
+            style: 'margin-bottom: 0.75rem; margin-left: 0.5rem',
+            title: 'Download file',
+            on: { click: () => downloadFile(path) }
+        }, el('img', { src: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEoAAABKCAYAAAAc0MJxAAAFIklEQVR4nO2cvU7zPBiGb9tpgBbKUhhAApYKlVMoCwssbBWHwcJZsHAUDAxsdGFATBwCExJigxE1gBChub+Bz3ndQoKbpiQgX5LVqM2Pn6uPU9d2K0jC8T2y6Ar8FpwoSwoRpZt7t9vl6uoqPc+jUopSSgohKISglJJKKXqex9XVVXa7XZrHFlLpIsrb2xuazSYBUClFIQQBDBQhBJVSBMBms8m3t7fC6ltY03t9fcXDwwOEEIiiCCQhhIhfF0KAJKIoghACDw8PeH19Laq6xYkSQkBKGQvSYjTDz0spB0T+NKW5mX917ylT16UwUbrt6+20/Yb3L4LSZFTZcaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIscaIsmYgom0kAz/Pi6ae0aShzH8/zcrl2Fr6/cgaEEOj3+3h5eUnc5+npaeRZmMfHR7y/vyfuW61WoZTKWOt0RJ7vgJ60vLy85MHBAe7u7uLnh69DMpY1PPk5UMH/XxNCYHZ29lP26UlSAFhbW8PR0RG2trbE8MxzLsHlWcIwRKvV+rSO4KdKq9ViGIa5x5V709OZoZSKm+B3+9tmVBpKKaumnJk8revFFqenpwRAz/MopYxXpiDn7NHnlFLS8zwC4OnpKc265FVyT1FdwcPDw1iWDihPWeY5taTDw8OJSJqIKJLo9/sgif39fQJgpVLJVZZ5rkqlQgDc39+nee1fIUpXOIoidDqdXGV9JanT6TCKoolJmqgonf5PT09ot9sDsnTJIkkXLandblN3MybR5CYuyqz4/f39wDJEM+hRJZnnaDabvL+/n7ikiYsi/90zrq+vsbCwMBBolqKPXVhY4PX19cA1frUoknh/fwdJXFxccHp6Ol7xa3u/MjNJSsmZmRleXFzQPPefEGUGdHx8HHcbbPpYX/WVjo+Pf1TSj4oyA7PtY6X1lX5S0o+LIu37WEX0lUolSgea1scqqq+UVlKHWcwxo2H0sEcWyI8vuc/Pz9jZ2eHV1RUqlcqnsSbP8xCGIdrtNs7Pz0WtVouPzcJY8SQZDIIAS0tLrNfrnJ+fZ71eH9heXl5mEASZ36G0Ppa5nVdfKQgCLC8vJ8aztLSUGk/iC71eD9VqNfHTqFarsdfrjd0EyX99LN3UdFPMs6/U6/VQq9US46lWq6nxJI6Z6zFq/VMMPZKot80x76xIKdHv97GxsYGTkxP4vo8wDBGGIXzfx8nJCTY2NtDv9yHleMP7Y8eT9g7Mzc0lfhrV6/WxM2o4s87Ozri+vs5Wq8Vut8s8MsmMp16vJ8YzNzeXGs9EJhdGRf94aHd3V2xvb0MIgUql8pHyY2ZSXpRCFID452i+7wMAoigqjSSgZBOgppgySQJKJqrMOFGWOFGWjCxq1LUAZcF2rUPi8aMeQDJ+/G4tQJmwXeuQROaUCIIA6+vrLPIH0aNAfkx0ZCVRlLn4wZzyNh+DIMh84SIxM8qcsk9700fOKNu1AGVF133U5pcoKh5eGDr5OO28LOi6D7eUtJgSP/WmpqbQaDQgpRz4I4e/gvnHE1JKNBoNTE1NJe7/pSiS8H0fm5ubiKIISqlP/3rxWxn+dw6lFKIoQrvdhu/7yVn11ZCCHkm8vb3FysrKpyGJv1DMWFZWVnh7ezsQ+3D5dhzn5uYGe3t7XFxcHGvdQFmKGcPi4iL39vZ4c3PzrYdc13D+Zdx3PUucKEucKEucKEucKEucKEv+A97GN/uTECooAAAAAElFTkSuQmCC', class: 'dl-icon', alt: 'download', style: 'width:14px;height:14px;vertical-align:middle' }));
+        pane.appendChild(dlBtn);
         renderContent();
 
         // Save / Cancel buttons (only for text files)
@@ -802,6 +832,20 @@ function hexDump(bytes) {
         lines.push(`${addr}  ${hex}  ${ascii}`);
     }
     return lines.join('\n');
+}
+
+async function downloadFile(path) {
+    try {
+        const res = await uiApi('file', { params: { file: path } });
+        const blob = new Blob([res.raw], { type: res.headers.get('Content-Type') || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = path.split('/').pop();
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+    } catch (e) { setError(e.message); }
 }
 
 async function deleteFile(path, version) {
@@ -1271,6 +1315,7 @@ async function showUsers() {
     state.view = 'users';
     state.project = null;
     setActiveNav('users-link');
+    setTitle('Users');
     setBreadcrumb([]);
 
     const app = document.getElementById('app');
@@ -1456,6 +1501,7 @@ function showSkill() {
     state.view = 'skill';
     state.project = null;
     setActiveNav('skill-link');
+    setTitle('Skill');
     setBreadcrumb([]);
 
     const SKILL_URL = 'projectcollab.skill';
@@ -1532,6 +1578,7 @@ function showAbout() {
     state.view = 'about';
     state.project = null;
     setActiveNav('about-link');
+    setTitle('About');
     setBreadcrumb([]);
 
     const app = document.getElementById('app');

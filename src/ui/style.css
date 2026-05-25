@@ -295,6 +295,16 @@ td.center, th.center { text-align: center; }
     text-decoration: underline;
 }
 
+.dl-icon {
+    width: 14px;
+    height: 14px;
+    vertical-align: middle;
+}
+
+[data-theme="dark"] .dl-icon {
+    filter: invert(1);
+}
+
 .copy-btn {
     background: transparent;
     border: 1px solid var(--border);
