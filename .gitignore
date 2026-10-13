@@ -1,2 +1,4 @@
 .collab
 .claude/
+guest-worker.env
+data/guest-worker.env

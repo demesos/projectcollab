@@ -68,6 +68,19 @@ try {
         case 'POST user-impact':         userImpact($user, json_body()); break;
         case 'GET whoami':               respond_json(200, ['email'=>$user['email'], 'role'=>$user['role']]); break;
 
+        case 'POST set-user-color':      setUserColor($user, json_body()); break;
+        case 'POST cycle-user-color':    cycleUserColor($user); break;
+        case 'GET user-colors':          userColorsList($user); break;
+        case 'POST toggle-kanban':       toggleKanban($user, json_body()); break;
+        case 'POST toggle-guest-workers': toggleGuestWorkers($user, json_body()); break;
+
+        // --- Kanban CRUD ---
+        case 'GET kanban':               getKanban($user); break;
+        case 'POST kanban-save':         saveKanban($user, json_body()); break;
+        case 'POST kanban-claim':        claimKanbanTask($user, json_body()); break;
+        case 'POST kanban-release':      releaseKanbanTask($user, json_body()); break;
+        case 'POST kanban-state':        stateKanbanTask($user, json_body()); break;
+
         // --- File proxy (human UI acts as owner agent) ---
         case 'GET files':                proxyGetFiles($user); break;
         case 'POST files-seen':          proxyFilesSeen($user); break;
@@ -79,6 +92,7 @@ try {
         case 'GET chat':                 proxyGetChat($user); break;
         case 'POST chat-seen':           proxyChatSeen($user); break;
         case 'POST chat':                proxyPostChat($user, json_body()); break;
+        case 'POST chat-clear':          proxyClearChat($user, json_body()); break;
 
         // --- News/presence proxy ---
         case 'GET news':                 proxyGetNews($user); break;
@@ -125,7 +139,7 @@ function listProjects(array $user): void {
             'created'          => $meta['created'] ?? null,
             'naming_scheme'    => $meta['naming_scheme'] ?? 'german',
             'shared_with'      => $meta['shared_with'] ?? [],
-            'agent_count'      => count($meta['agents'] ?? []),
+            'agent_count'      => count(array_filter($meta['agents'] ?? [], fn($a) => empty($a['admin']))),
             'file_count'       => $fileCount,
             'chat_count'       => $chatCount,
             'last_activity'    => $lastActivity === '1970-01-01T00:00:00Z' ? null : $lastActivity,
@@ -143,12 +157,20 @@ function getProject(array $user): void {
     $meta = jsonRead("$dir/meta.json") ?? [];
     $versions = jsonRead("$dir/versions.json") ?? [];
 
+    // Secrets are only revealed to the agent's own creator (see agentOwner()).
+    // Admins and the project owner see every secret; for agents that are not
+    // theirs 'mine' is false so the UI can render secret + remove button greyed out.
+    $seesAll = has_role_at_least($user, 'admin') || $owner === $user['email'];
     $agents = [];
     foreach ($meta['agents'] ?? [] as $secret => $info) {
+        $mine = agentOwner($info, $owner) === $user['email'];
         $agents[] = [
-            'secret'    => $secret,
+            'secret'    => ($mine || $seesAll) ? $secret : null,
+            'mine'      => $mine,
             'name'      => $info['name'] ?? '',
             'role'      => $info['role'] ?? '',
+            'class'     => $info['class'] ?? 'manager',
+            'id'        => $info['id'] ?? null,
             'admin'     => !empty($info['admin']),
             'last_seen' => $versions['last_seen'][$secret] ?? null,
         ];
@@ -158,6 +180,8 @@ function getProject(array $user): void {
         'name'             => $project,
         'owner'            => $owner,
         'role_in_project'  => $owner === $user['email'] ? 'owner' : 'member',
+        'has_kanban'       => !empty($meta['has_kanban']),
+        'guest_workers'    => !empty($meta['guest_workers']),
         'display_name'     => $meta['name'] ?? $project,
         'description'      => $meta['description'] ?? '',
         'created'          => $meta['created'] ?? null,
@@ -212,7 +236,7 @@ function createProject(array $user, array $body): void {
         'naming_scheme'  => $namingScheme,
         'shared_with'    => [],
         'agents'         => [
-            $ownerSecret => ['name' => $ownerLocal, 'role' => 'owner', 'admin' => true],
+            $ownerSecret => ['name' => $ownerLocal, 'role' => 'owner', 'admin' => true, 'class' => 'manager', 'id' => gen_agent_id()],
         ],
     ];
     writeWithPerms("$dir/meta.json", json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
@@ -307,7 +331,8 @@ function leaveProject(array $user, array $body): void {
 function backupProject(array $user): void {
     $project = (string) ($_GET['p'] ?? '');
     $owner = (string) ($_GET['owner'] ?? $user['email']);
-    requireProjectAccess($user, $owner, $project);
+    // Owner/admin only: the archive contains meta.json with every agent secret.
+    requireProjectOwner($user, $owner, $project);
     $dir = project_dir($owner, $project);
     if (!is_dir($dir)) respond_json(404, ['error' => 'Project not found']);
     $stamp = gmdate('Ymd-His');
@@ -339,11 +364,18 @@ function addAgent(array $user, array $body): void {
         respond_json(400, ['error' => 'name and role required']);
     }
 
+    $class = trim((string) ($body['class'] ?? 'worker'));
+    if (!valid_agent_class($class)) {
+        respond_json(400, ['error' => "class must be one of: manager, worker"]);
+    }
+
     $secret = bin2hex(random_bytes(16));
-    $meta['agents'][$secret] = ['name' => $name, 'role' => $role];
+    $id     = gen_agent_id();
+    $meta['agents'][$secret] = ['name' => $name, 'role' => $role, 'class' => $class, 'id' => $id,
+                                'created_by' => $user['email']];
 
     writeWithPerms($metaPath, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
-    respond_json(200, ['secret' => $secret, 'name' => $name, 'role' => $role]);
+    respond_json(200, ['secret' => $secret, 'name' => $name, 'role' => $role, 'class' => $class, 'id' => $id]);
 }
 
 function removeAgent(array $user, array $body): void {
@@ -361,6 +393,10 @@ function removeAgent(array $user, array $body): void {
     }
     if (!empty($meta['agents'][$secret]['admin'])) {
         respond_json(400, ['error' => 'Cannot remove the owner agent']);
+    }
+    if (agentOwner($meta['agents'][$secret], $owner) !== $user['email']
+        && $owner !== $user['email'] && !has_role_at_least($user, 'admin')) {
+        respond_json(403, ['error' => 'forbidden', 'message' => 'Only the creator of this agent or the project owner can remove it']);
     }
     unset($meta['agents'][$secret]);
     writeWithPerms($metaPath, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
@@ -697,6 +733,7 @@ function restoreBackup(array $user): void {
             if ($isOwnerAgent) {
                 $agentInfo['name'] = $ownerLocal;  // always update owner display name to restoring user
             }
+            unset($agentInfo['created_by']);       // shares are dropped → all agents belong to the restoring owner
             $newAgents[$newSecret] = $agentInfo;
             $usedSecrets[$newSecret] = true;       // mark as used so later agents in same loop don't collide
         }
@@ -727,6 +764,576 @@ function restoreBackup(array $user): void {
 // AGENT API PROXY — direct filesystem implementation (no HTTP loopback)
 // =============================================================================
 
+
+// ==========================================================================
+// === Color endpoints + Kanban toggle (Checkpoint 1.2) =====================
+// ==========================================================================
+
+/**
+ * POST set-user-color
+ *   body: { color?: "#RRGGBB" }     — if absent, server generates one
+ * Updates the current user's color. Pushes the new color onto color_history
+ * (deduping; capping at KANBAN_COLOR_HISTORY_MAX). Active color is always at
+ * index 0 of color_history.
+ *
+ * Validation:
+ *   - If color supplied, must be #RRGGBB hex and pass separation check vs.
+ *     azzurro and other users' colors. If too close, returns 409 with the
+ *     conflicting user's email so the client can show a helpful message.
+ *   - To bypass separation (user really wants this exact color), client may
+ *     send {color, force: true}.
+ */
+function setUserColor(array $user, array $body): void {
+    $email = $user['email'];
+    $info  = user_get($email) ?? [];
+    $color = isset($body['color']) ? trim((string) $body['color']) : '';
+    $force = !empty($body['force']);
+
+    if ($color === '') {
+        // Generate fresh — exclude current user's own color so we don't
+        // collide with it (which would be silly).
+        $color = generate_user_color(collect_other_user_colors($email));
+    } else {
+        if (!valid_hex_color($color)) {
+            respond_json(400, ['error' => 'invalid_color',
+                'message' => 'Color must be in #RRGGBB form']);
+        }
+        if (!$force) {
+            $conflict = checkColorSeparation($email, $color);
+            if ($conflict !== null) {
+                respond_json(409, [
+                    'error' => 'color_too_close',
+                    'message' => $conflict['message'],
+                    'conflict_with' => $conflict['with'],
+                    'distance' => $conflict['distance'],
+                ]);
+            }
+        }
+    }
+
+    $history = $info['color_history'] ?? [];
+    // De-dupe (remove existing occurrences of $color), then prepend.
+    $history = array_values(array_filter($history, fn($c) => $c !== $color));
+    array_unshift($history, $color);
+    if (count($history) > KANBAN_COLOR_HISTORY_MAX) {
+        $history = array_slice($history, 0, KANBAN_COLOR_HISTORY_MAX);
+    }
+
+    $info['color']         = $color;
+    $info['color_history'] = $history;
+    user_put($email, $info);
+
+    respond_json(200, ['color' => $color, 'history' => $history]);
+}
+
+/**
+ * POST cycle-user-color
+ *   body: {}
+ * Cycles color_history by one step: takes the SECOND color in history and
+ * makes it the active color. Active rotates to the end. This makes
+ * right-click "go back" through previous picks, wrapping around after the
+ * full list.
+ *
+ * If history has 0 or 1 entries, nothing changes (returns current).
+ */
+function cycleUserColor(array $user): void {
+    $email = $user['email'];
+    $info  = user_get($email) ?? [];
+    $history = $info['color_history'] ?? [];
+    if (count($history) < 2) {
+        respond_json(200, [
+            'color' => $info['color'] ?? null,
+            'history' => $history,
+            'cycled' => false,
+        ]);
+    }
+
+    // Rotate left: [A, B, C, D] -> [B, C, D, A]
+    $front = array_shift($history);
+    $history[] = $front;
+    $info['color']         = $history[0];
+    $info['color_history'] = $history;
+    user_put($email, $info);
+
+    respond_json(200, [
+        'color' => $info['color'],
+        'history' => $history,
+        'cycled' => true,
+    ]);
+}
+
+/**
+ * GET user-colors
+ * Returns { email: "#RRGGBB", ... } for every user with a color set.
+ * Open to any logged-in user (mirrors user-suggestions).
+ */
+function userColorsList(array $user): void {
+    $d = users_load();
+    $out = [];
+    foreach (($d['users'] ?? []) as $email => $info) {
+        if (!empty($info['color']) && valid_hex_color($info['color'])) {
+            $out[$email] = $info['color'];
+        }
+    }
+    respond_json(200, ['colors' => $out, 'azzurro' => KANBAN_AZZURRO]);
+}
+
+/**
+ * POST toggle-kanban
+ *   body: { owner, project, enabled: bool }
+ * Owner-or-admin gated. Sets has_kanban in meta.json. If turning on for the
+ * first time, seeds kanban.json with a single "Phase 0" WP.
+ */
+function toggleKanban(array $user, array $body): void {
+    $project = (string) ($body['project'] ?? '');
+    $owner   = (string) ($body['owner'] ?? $user['email']);
+    $enabled = !empty($body['enabled']);
+    requireProjectOwner($user, $owner, $project);
+
+    $dir = project_dir($owner, $project);
+    project_set_kanban($dir, $enabled);
+    // Guest workers require a board; if Kanban is turned off, turn guests off too
+    // so the invariant (guest_workers => has_kanban) holds.
+    if (!$enabled && project_has_guest_workers($dir)) {
+        project_set_guest_workers($dir, false);
+    }
+    respond_json(200, [
+        'enabled' => $enabled,
+        'has_kanban_file' => is_file(kanban_path($dir)),
+        'guest_workers' => project_has_guest_workers($dir),
+    ]);
+}
+
+/**
+ * POST toggle-guest-workers
+ *   body: { owner, project, enabled: bool }
+ * Owner-or-admin gated. Sets guest_workers in meta.json. Enabling requires the
+ * Kanban board to be enabled first (guests only ever work board tasks).
+ */
+function toggleGuestWorkers(array $user, array $body): void {
+    $project = (string) ($body['project'] ?? '');
+    $owner   = (string) ($body['owner'] ?? $user['email']);
+    $enabled = !empty($body['enabled']);
+    requireProjectOwner($user, $owner, $project);
+
+    $dir = project_dir($owner, $project);
+    if ($enabled && !project_has_kanban($dir)) {
+        respond_json(400, ['error' => 'kanban_required',
+            'message' => 'Enable the Kanban board before allowing guest workers.']);
+    }
+    project_set_guest_workers($dir, $enabled);
+    respond_json(200, ['guest_workers' => $enabled]);
+}
+
+// --- Helpers --------------------------------------------------------------
+
+/**
+ * Check if $color is too close to azzurro or to any OTHER user's color.
+ * Returns null if OK, or ['with' => email|'azzurro', 'message' => ..., 'distance' => deg].
+ */
+function checkColorSeparation(string $email, string $color): ?array {
+    [$h, , ] = hex_to_hsl($color);
+    [$ah, , ] = hex_to_hsl(KANBAN_AZZURRO);
+    $da = hue_distance($h, $ah);
+    if ($da < KANBAN_HUE_MIN_SEPARATION) {
+        return [
+            'with' => 'azzurro',
+            'message' => sprintf('Too close to azzurro (agent color): %.0f° apart, need ≥%.0f°',
+                $da, KANBAN_HUE_MIN_SEPARATION),
+            'distance' => round($da, 1),
+        ];
+    }
+    $d = users_load();
+    foreach (($d['users'] ?? []) as $otherEmail => $info) {
+        if ($otherEmail === $email) continue;
+        $oc = $info['color'] ?? '';
+        if (!valid_hex_color($oc)) continue;
+        [$oh, , ] = hex_to_hsl($oc);
+        $du = hue_distance($h, $oh);
+        if ($du < KANBAN_HUE_MIN_SEPARATION) {
+            return [
+                'with' => $otherEmail,
+                'message' => sprintf('Too close to %s: %.0f° apart, need ≥%.0f°',
+                    $otherEmail, $du, KANBAN_HUE_MIN_SEPARATION),
+                'distance' => round($du, 1),
+            ];
+        }
+    }
+    return null;
+}
+
+
+// ==========================================================================
+// === Kanban CRUD endpoints (Checkpoint 1.3) ===============================
+// ==========================================================================
+
+/**
+ * GET kanban?owner=&p=
+ * Returns full Kanban board with computed states, expired claims swept,
+ * and per-task actor_color attached for the client.
+ */
+function getKanban(array $user): void {
+    $project = (string) ($_GET['p'] ?? '');
+    $owner   = (string) ($_GET['owner'] ?? $user['email']);
+    requireProjectAccess($user, $owner, $project);
+    $dir = project_dir($owner, $project);
+
+    if (!project_has_kanban($dir)) {
+        respond_json(404, ['error' => 'kanban_disabled',
+            'message' => 'Kanban is not enabled for this project']);
+    }
+
+    // Take the lock once: sweep runs inside, version only bumps if something
+    // actually expired (callback signals no other change).
+    [$data, ] = kanban_with_lock($dir, null, function(array &$d) {
+        return ['_no_change' => true];
+    });
+    kanban_compute_states($data);
+
+    // Attach actor_color per task
+    $colorMap = ['agent' => KANBAN_AZZURRO];
+    $usersData = users_load();
+    foreach (($usersData['users'] ?? []) as $email => $info) {
+        if (!empty($info['color']) && valid_hex_color($info['color'])) {
+            $colorMap[$email] = $info['color'];
+        }
+    }
+    foreach ($data['wps'] as &$wp) {
+        foreach ($wp['tasks'] as &$task) {
+            $cap = $task['capability'] ?? 'agent';
+            $actorEmail = $task['actor_email'] ?? null;
+            if ($cap === 'agent') {
+                $task['actor_color'] = KANBAN_AZZURRO;
+                $task['actor_label'] = 'agent';
+            } elseif ($actorEmail && isset($colorMap[$actorEmail])) {
+                $task['actor_color'] = $colorMap[$actorEmail];
+                $task['actor_label'] = $actorEmail;
+            } else {
+                // Unpinned human task — neutral warm fallback
+                $task['actor_color'] = null;
+                $task['actor_label'] = 'human';
+            }
+        }
+        unset($task);
+    }
+    unset($wp);
+
+    respond_json(200, $data);
+}
+
+/**
+ * POST kanban-save
+ *   body: { owner, project, wps, expected_version, next_wp_id?, next_task_id? }
+ * Structural save: replaces the whole wps array. Validates schema, preserves
+ * claimed/done state where present, increments kanban_version.
+ *
+ * Permission: any project member (matches file-write permissions).
+ */
+function saveKanban(array $user, array $body): void {
+    $project = (string) ($body['project'] ?? '');
+    $owner   = (string) ($body['owner'] ?? $user['email']);
+    requireProjectAccess($user, $owner, $project);
+    $dir = project_dir($owner, $project);
+    if (!project_has_kanban($dir)) {
+        respond_json(404, ['error' => 'kanban_disabled']);
+    }
+
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    $wps = $body['wps'] ?? null;
+    if (!is_array($wps)) respond_json(400, ['error' => 'bad_request',
+        'message' => 'wps must be an array']);
+
+    // Schema validation
+    $err = validateKanbanWps($wps);
+    if ($err !== null) respond_json(400, ['error' => 'invalid_schema', 'message' => $err]);
+
+    try {
+        [$saved, ] = kanban_with_lock($dir, $expected, function(array &$d) use ($wps, $body) {
+            $d['wps'] = $wps;
+            if (isset($body['next_wp_id']))   $d['next_wp_id']   = (int) $body['next_wp_id'];
+            if (isset($body['next_task_id'])) $d['next_task_id'] = (int) $body['next_task_id'];
+        });
+        respond_json(200, ['kanban_version' => $saved['kanban_version'],
+            'wps' => $saved['wps']]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) {
+            $cur = (int) substr($e->getMessage(), strlen('KANBAN_VERSION_CONFLICT:'));
+            $latest = kanban_load($dir);
+            kanban_compute_states($latest);
+            respond_json(409, [
+                'error' => 'version_conflict',
+                'message' => "Kanban was modified. Your version was $expected, current is $cur.",
+                'current_version' => $cur,
+                'current' => $latest,
+            ]);
+        }
+        throw $e;
+    }
+}
+
+/**
+ * POST kanban-claim
+ *   body: { owner, project, task_id, expected_version }
+ * Atomic claim. Sets state='claimed', claimed_by=user.email, claimed_at=now.
+ * Fails 409 if already claimed by someone else, or if version stale.
+ * If the task is currently 'open', the claim is rejected with 'task_not_ready'.
+ */
+function claimKanbanTask(array $user, array $body): void {
+    $project = (string) ($body['project'] ?? '');
+    $owner   = (string) ($body['owner'] ?? $user['email']);
+    requireProjectAccess($user, $owner, $project);
+    $dir = project_dir($owner, $project);
+    if (!project_has_kanban($dir)) respond_json(404, ['error' => 'kanban_disabled']);
+
+    $taskId   = (string) ($body['task_id'] ?? '');
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    if ($taskId === '') respond_json(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+
+    $email = $user['email'];
+    try {
+        [$saved, $result] = kanban_with_lock($dir, $expected, function(array &$d) use ($taskId, $email) {
+            $task = &kanbanFindTask($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            $state = $task['state'] ?? 'open';
+            if ($state === 'open') return ['_no_change' => true, 'error' => 'task_not_ready'];
+            if ($state === 'claimed') {
+                $existing = $task['claimed_by'] ?? null;
+                if ($existing !== null && $existing !== $email) {
+                    return ['_no_change' => true, 'error' => 'already_claimed',
+                            'claimed_by' => $existing,
+                            'claimed_at' => $task['claimed_at'] ?? null];
+                }
+                // Same user re-claiming is a no-op refresh.
+            }
+            $task['state']      = 'claimed';
+            $task['claimed_by'] = $email;
+            $task['claimed_by_name'] = $email;
+            $task['claimed_at'] = now_iso();
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            $code = $result['error'] === 'task_not_found' ? 404
+                  : ($result['error'] === 'already_claimed' ? 409 : 409);
+            respond_json($code, $result);
+        }
+        $task = kanbanFindTask($saved, $taskId);
+        respond_json(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => $task]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) {
+            respond_versionConflict($dir, $e);
+        }
+        throw $e;
+    }
+}
+
+/**
+ * POST kanban-release
+ *   body: { owner, project, task_id, expected_version }
+ * Release my own claim. Only the claimer can release (owner/admin can too).
+ * Reverts state to 'ready'.
+ */
+function releaseKanbanTask(array $user, array $body): void {
+    $project = (string) ($body['project'] ?? '');
+    $owner   = (string) ($body['owner'] ?? $user['email']);
+    requireProjectAccess($user, $owner, $project);
+    $dir = project_dir($owner, $project);
+    if (!project_has_kanban($dir)) respond_json(404, ['error' => 'kanban_disabled']);
+
+    $taskId   = (string) ($body['task_id'] ?? '');
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    if ($taskId === '') respond_json(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+
+    $email = $user['email'];
+    $isPriv = ($owner === $email) || has_role_at_least($user, 'admin');
+
+    try {
+        [$saved, $result] = kanban_with_lock($dir, $expected, function(array &$d)
+                use ($taskId, $email, $isPriv) {
+            $task = &kanbanFindTask($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            if (($task['state'] ?? '') !== 'claimed') {
+                return ['_no_change' => true, 'error' => 'not_claimed'];
+            }
+            $cb = $task['claimed_by'] ?? null;
+            if ($cb !== $email && !$isPriv) {
+                return ['_no_change' => true, 'error' => 'forbidden',
+                        'message' => 'Only the claimer or owner can release'];
+            }
+            $task['state']      = 'ready';
+            $task['claimed_by'] = null;
+            $task['claimed_by_name'] = null;
+            $task['claimed_at'] = null;
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            $code = $result['error'] === 'task_not_found' ? 404
+                  : ($result['error'] === 'forbidden' ? 403 : 409);
+            respond_json($code, $result);
+        }
+        $task = kanbanFindTask($saved, $taskId);
+        respond_json(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => $task]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) {
+            respond_versionConflict($dir, $e);
+        }
+        throw $e;
+    }
+}
+
+/**
+ * POST kanban-state
+ *   body: { owner, project, task_id, new_state, comment?, expected_version }
+ * Transition a task to a new state. Allowed transitions:
+ *   claimed → partly  (with comment, optional)
+ *   claimed → done    (with comment, optional)
+ *   partly  → claimed (re-claim for follow-up, by anyone capable)
+ *   done    → partly  (test failed; with comment recommended)
+ *   any     → ready   (release: handled by kanban-release instead)
+ *
+ * The 'comment' field, if present, is appended to task.comments as
+ *   { by, at, text }.
+ *
+ * Permissions:
+ *   - 'claimed → partly|done': only the claimer (or owner/admin) can do this.
+ *   - 'partly → claimed': any project member (auto-sets claimer = user).
+ *   - 'done → partly': any project member (tester role).
+ */
+function stateKanbanTask(array $user, array $body): void {
+    $project = (string) ($body['project'] ?? '');
+    $owner   = (string) ($body['owner'] ?? $user['email']);
+    requireProjectAccess($user, $owner, $project);
+    $dir = project_dir($owner, $project);
+    if (!project_has_kanban($dir)) respond_json(404, ['error' => 'kanban_disabled']);
+
+    $taskId    = (string) ($body['task_id'] ?? '');
+    $newState  = (string) ($body['new_state'] ?? '');
+    $comment   = isset($body['comment']) ? trim((string) $body['comment']) : '';
+    $expected  = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+
+    if ($taskId === '') respond_json(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+    if (!in_array($newState, ['partly', 'done', 'claimed'], true)) {
+        respond_json(400, ['error' => 'bad_request',
+            'message' => "new_state must be one of: partly, done, claimed"]);
+    }
+
+    $email = $user['email'];
+    $isPriv = ($owner === $email) || has_role_at_least($user, 'admin');
+
+    try {
+        [$saved, $result] = kanban_with_lock($dir, $expected,
+                function(array &$d) use ($taskId, $newState, $comment, $email, $isPriv) {
+            $task = &kanbanFindTask($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            $cur = $task['state'] ?? 'open';
+            $allowed = false;
+
+            if ($cur === 'claimed' && ($newState === 'partly' || $newState === 'done')) {
+                $cb = $task['claimed_by'] ?? null;
+                if ($cb === $email || $isPriv) $allowed = true;
+                else return ['_no_change' => true, 'error' => 'forbidden',
+                    'message' => 'Only the claimer can mark partly/done'];
+            } elseif ($cur === 'partly' && $newState === 'claimed') {
+                $allowed = true;
+            } elseif ($cur === 'done' && $newState === 'partly') {
+                $allowed = true;
+            } elseif ($cur === 'ready' && $newState === 'claimed') {
+                $allowed = true;
+            } else {
+                return ['_no_change' => true, 'error' => 'invalid_transition',
+                    'message' => "Cannot move from $cur to $newState"];
+            }
+
+            $task['state'] = $newState;
+            if ($newState === 'claimed') {
+                $task['claimed_by'] = $email;
+                $task['claimed_by_name'] = $email;
+                $task['claimed_at'] = now_iso();
+            } elseif ($newState === 'done') {
+                $task['completed_by'] = $email;
+                $task['completed_by_name'] = $email;
+                $task['completed_at'] = now_iso();
+                $task['claimed_by']   = null;
+                $task['claimed_by_name'] = null;
+                $task['claimed_at']   = null;
+            } elseif ($newState === 'partly') {
+                // keep claimed_by/at as historical info but clear "active" claim
+                $task['claimed_by'] = null;
+                $task['claimed_by_name'] = null;
+                $task['claimed_at'] = null;
+            }
+            if ($comment !== '') {
+                if (!isset($task['comments']) || !is_array($task['comments'])) {
+                    $task['comments'] = [];
+                }
+                $task['comments'][] = [
+                    'by' => $email,
+                    'by_name' => $email,
+                    'at' => now_iso(),
+                    'text' => $comment,
+                ];
+            }
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            $code = $result['error'] === 'task_not_found' ? 404
+                  : ($result['error'] === 'forbidden' ? 403 : 409);
+            respond_json($code, $result);
+        }
+        $task = kanbanFindTask($saved, $taskId);
+        respond_json(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => $task]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) {
+            respond_versionConflict($dir, $e);
+        }
+        throw $e;
+    }
+}
+
+// --- Kanban CRUD helpers --------------------------------------------------
+
+/**
+ * Locate a task by id within the board. Returns a reference to the task
+ * (so callers can mutate) or null if not found.
+ * IMPORTANT: callers MUST use & on the assignment: `$t = &kanbanFindTask(...)`.
+ */
+function &kanbanFindTask(array &$data, string $taskId) {
+    $null = null;
+    foreach ($data['wps'] as $wi => $wp) {
+        foreach (($wp['tasks'] ?? []) as $ti => $task) {
+            if (($task['id'] ?? '') === $taskId) {
+                return $data['wps'][$wi]['tasks'][$ti];
+            }
+        }
+    }
+    return $null;
+}
+
+/**
+ * Validate the wps array schema. Returns null on success or an error string.
+ * Delegates to the shared implementation in lib.php.
+ */
+function validateKanbanWps(array $wps): ?string {
+    return kanban_validate_wps($wps);
+}
+
+/**
+ * Emit a 409 with the latest board state. Used after KANBAN_VERSION_CONFLICT.
+ */
+function respond_versionConflict(string $dir, RuntimeException $e): void {
+    $cur = (int) substr($e->getMessage(), strlen('KANBAN_VERSION_CONFLICT:'));
+    $latest = kanban_load($dir);
+    kanban_compute_states($latest);
+    respond_json(409, [
+        'error' => 'version_conflict',
+        'message' => "Kanban was modified. Current version is $cur.",
+        'current_version' => $cur,
+        'current' => $latest,
+    ]);
+}
+
 function resolveProjectContext(array $user): array {
     $project = (string) ($_GET['p'] ?? '');
     $owner   = (string) ($_GET['owner'] ?? $user['email']);
@@ -752,13 +1359,25 @@ function uiWithLock(string $dir, callable $fn) {
 
 function readVersions(string $dir): array {
     $v = jsonRead("$dir/versions.json") ?? [];
-    if (!isset($v['files']))     $v['files']     = [];
-    if (!isset($v['reads']))     $v['reads']     = [];
-    if (!isset($v['last_seen'])) $v['last_seen'] = [];
+    // Normalize: 'files' and 'reads' must be associative maps, not sequential arrays.
+    // A serialization bug can produce "files":[] on disk (json_encode([]) = "[]").
+    // If non-empty and first key is an integer, reset to empty (wrong data type).
+    $files = $v['files'] ?? [];
+    if (!is_array($files) || (!empty($files) && is_int(array_key_first($files)))) $files = [];
+    $reads = $v['reads'] ?? [];
+    if (!is_array($reads) || (!empty($reads) && is_int(array_key_first($reads)))) $reads = [];
+    $v['files']     = $files;
+    $v['reads']     = $reads;
+    $v['last_seen'] = $v['last_seen'] ?? [];
     return $v;
 }
 
 function writeVersions(string $dir, array $v): void {
+    // 'files' and 'reads' must always be JSON objects ({}) not arrays ([]).
+    // PHP encodes an empty array as [] but an empty stdClass as {}.
+    // A corrupt or uninitialized [] would make all files invisible on the next read.
+    if (empty($v['files'])) $v['files'] = new \stdClass();
+    if (empty($v['reads'])) $v['reads'] = new \stdClass();
     writeWithPerms("$dir/versions.json", json_encode($v, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
 }
 
@@ -766,6 +1385,26 @@ function validateFilePath(string $path): string {
     $path = ltrim(str_replace('\\', '/', $path), '/');
     if ($path === '' || strpos($path, '..') !== false || strpos($path, "\0") !== false) {
         respond_json(400, ['error' => 'Invalid file path']);
+    }
+    // Same positive whitelist as the agent API (src/api/index.php) so that
+    // files uploaded via the web UI can always be retrieved via the agent
+    // API. Uploading a file with characters outside this set is rejected
+    // here with a clear message rather than silently creating a file that
+    // the agent API will later refuse to serve.
+    //
+    // Allowed:  a-z A-Z 0-9  . _ - /  SPACE ( ) + ! ' , @ = ~
+    // Blocked:  % # ? * \ & ; | ` < > "  (URL-structural, shell-dangerous,
+    //           or forbidden on Windows filesystems)
+    if (!preg_match('#^[a-zA-Z0-9._/\x20()+!\'\\,@=~-]+$#', $path)) {
+        respond_json(400, ['error' => 'illegal_characters',
+            'message' => 'Filename contains illegal characters. '
+                . 'Allowed: letters, digits, spaces, and: . _ - ( ) + ! \' , @ = ~ /']);
+    }
+    foreach (explode('/', $path) as $comp) {
+        if ($comp === '' || trim($comp) === '' || $comp !== trim($comp)) {
+            respond_json(400, ['error' => 'illegal_characters',
+                'message' => 'Path component is empty or has leading/trailing whitespace']);
+        }
     }
     return $path;
 }
@@ -956,10 +1595,44 @@ function proxyPostChat(array $user, array $body): void {
     respond_json(200, ['id' => $msg['id'], 'time' => $msg['time'], 'from' => $msg['from']]);
 }
 
+// POST ?action=chat-clear  (optionally keeps the last N messages)
+function proxyClearChat(array $user, array $body): void {
+    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    // keep_count: number of most recent messages to retain (0 = clear all).
+    // keep_last (legacy bool) is still honoured as "keep 1" for older clients.
+    $keepCount = isset($body['keep_count']) ? max(0, (int)$body['keep_count']) : (!empty($body['keep_last']) ? 1 : 0);
+    $chatPath = "$dir/chat.log";
+    uiWithLock($dir, function() use ($chatPath, $keepCount) {
+        if (!is_file($chatPath)) return;
+        if ($keepCount > 0) {
+            $lines = file($chatPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            $validLines = array_values(array_filter($lines, fn($l) => is_array(json_decode($l, true))));
+            $kept = array_slice($validLines, -$keepCount);
+            file_put_contents($chatPath, $kept ? (implode("\n", $kept) . "\n") : '');
+        } else {
+            file_put_contents($chatPath, '');
+        }
+    });
+    respond_json(200, ['ok' => true]);
+}
+
 // GET ?action=news
 function proxyGetNews(array $user): void {
-    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
+    [$secret, $owner, $project, $dir, $meta] = resolveProjectContext($user);
     $userKey = $user['email'];
+
+    // Touch last_seen for the agent matching this human user (by email local-part).
+    // Runs every 5s poll — cheap write, no extra HTTP call needed.
+    $displayName = strstr($user['email'], '@', true) ?: $user['email'];
+    foreach ($meta['agents'] ?? [] as $s => $info) {
+        if (strcasecmp($info['name'] ?? '', $displayName) === 0 && $s !== $secret) {
+            $v2 = readVersions($dir);
+            $v2['last_seen'][$s] = now_iso();
+            writeVersions($dir, $v2);
+            break;
+        }
+    }
+
     $v = readVersions($dir);
 
     // files_list_unread: true only if new/changed files appeared since user last viewed the list
@@ -986,10 +1659,9 @@ function proxyGetNews(array $user): void {
 
 // GET ?action=presence
 function proxyGetPresence(array $user): void {
-    [$secret, $owner, $project, $dir] = resolveProjectContext($user);
-    $v    = readVersions($dir);
-    $meta = jsonRead("$dir/meta.json") ?? [];
-    $out  = [];
+    [$secret, $owner, $project, $dir, $meta] = resolveProjectContext($user);
+    $v   = readVersions($dir);
+    $out = [];
     foreach ($meta['agents'] ?? [] as $s => $info) {
         $out[] = ['name' => $info['name'] ?? '', 'role' => $info['role'] ?? '', 'last_seen' => $v['last_seen'][$s] ?? null];
     }
@@ -1007,6 +1679,12 @@ function requireProjectAccess(array $user, string $owner, string $project): void
     if (!user_can_access($user['email'], $owner, $project)) {
         respond_json(403, ['error' => 'forbidden', 'message' => 'You do not have access to this project']);
     }
+}
+
+// Email of the user who owns an agent. Agents created before 'created_by'
+// existed (and the owner agent) belong to the project owner.
+function agentOwner(array $info, string $projectOwner): string {
+    return (string) ($info['created_by'] ?? $projectOwner);
 }
 
 function requireProjectOwner(array $user, string $owner, string $project): void {

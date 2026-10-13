@@ -214,3 +214,64 @@ echo "$RESPONSE" | jq -r .current_version  # use this in the retry
 ```
 
 After merging your changes with the diff, retry the PUT with `X-Expected-Version: <current_version>`.
+
+## Kanban — read the board
+
+```bash
+curl -s -H "X-Agent-Secret: $SECRET" \
+  "$BASE/$PROJECT/kanban" | jq '.kanban_version, .wps'
+```
+
+## Kanban — claim a ready task
+
+```bash
+# read version first
+VER=$(curl -s -H "X-Agent-Secret: $SECRET" "$BASE/$PROJECT/kanban" | jq .kanban_version)
+curl -s -X POST -H "X-Agent-Secret: $SECRET" -H "Content-Type: application/json" \
+  -d "{\"task_id\":\"t_007\",\"expected_version\":$VER}" \
+  "$BASE/$PROJECT/kanban-claim"
+```
+
+## Kanban — mark done (with comment) / mark partly before leaving
+
+```bash
+curl -s -X POST -H "X-Agent-Secret: $SECRET" -H "Content-Type: application/json" \
+  -d "{\"task_id\":\"t_007\",\"new_state\":\"done\",\"comment\":\"Implemented and tested.\",\"expected_version\":$VER}" \
+  "$BASE/$PROJECT/kanban-state"
+
+# leaving mid-task: hand off via partly + comment
+curl -s -X POST -H "X-Agent-Secret: $SECRET" -H "Content-Type: application/json" \
+  -d "{\"task_id\":\"t_007\",\"new_state\":\"partly\",\"comment\":\"Done X; next is Y.\",\"expected_version\":$VER}" \
+  "$BASE/$PROJECT/kanban-state"
+```
+
+## Kanban — comment on a task
+
+```bash
+curl -s -X POST -H "X-Agent-Secret: $SECRET" -H "Content-Type: application/json" \
+  -d "{\"task_id\":\"t_007\",\"text\":\"Question about the spec…\",\"expected_version\":$VER}" \
+  "$BASE/$PROJECT/kanban-comment"
+```
+
+## Kanban — edit board structure (managers only)
+
+```bash
+# GET, mutate .wps locally, then save the whole array back
+curl -s -X POST -H "X-Agent-Secret: $SECRET" -H "Content-Type: application/json" \
+  -d "{\"wps\":$WPS_JSON,\"expected_version\":$VER}" \
+  "$BASE/$PROJECT/kanban-save"
+```
+
+## Guest worker — connect, then work with the token
+
+```bash
+# 1. connect with the SHARED guest secret (no project) -> get name + token + project
+RESP=$(curl -s -H "X-Agent-Secret: $GUEST_SECRET" "$BASE/")
+TOKEN=$(echo "$RESP"  | jq -r .token)
+GPROJ=$(echo "$RESP"  | jq -r .project)
+echo "$RESP" | jq '{name, project, available_task_count}'
+
+# 2. from now on authenticate with the TOKEN, address the assigned project
+curl -s -H "X-Agent-Secret: $TOKEN" "$BASE/$GPROJ/kanban" | jq '.wps'
+# claim/state/comment exactly as a worker, using $TOKEN
+```

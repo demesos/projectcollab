@@ -2,6 +2,7 @@
 require '/home/collab/data/lib/lib.php';
 $user = require_login();
 $siteName = (string) cfg_get('site_name', 'ProjectCollab');
+$userColor = isset($user['color']) && is_string($user['color']) ? $user['color'] : '';
 ?><!DOCTYPE html>
 <html lang="en">
 <head>
@@ -28,6 +29,7 @@ $siteName = (string) cfg_get('site_name', 'ProjectCollab');
                 <span class="muted">(<?= html_escape($user['role']) ?>)</span>
             </span>
             <a href="logout.php" class="logout-link">Log out</a>
+            <button id="color-swatch" title="Click: new color · Right-click: previous"<?php if ($userColor !== ''): ?> style="background:<?= html_escape($userColor) ?>"<?php endif; ?>></button>
             <button id="theme-toggle" title="Toggle theme">◐</button>
         </div>
     </div>
@@ -45,6 +47,8 @@ $siteName = (string) cfg_get('site_name', 'ProjectCollab');
 window.CURRENT_USER = <?= json_encode([
     'email' => $user['email'],
     'role'  => $user['role'],
+    'color' => $userColor,
+    'color_history' => (isset($user['color_history']) && is_array($user['color_history'])) ? $user['color_history'] : [],
 ], JSON_UNESCAPED_SLASHES) ?>;
 </script>
 <script src="app.js"></script>

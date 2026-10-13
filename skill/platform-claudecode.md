@@ -62,7 +62,7 @@ PowerShell's `>` and `Out-File` default to UTF-16 LE with BOM, which the server 
 **Fix:** Use `Out-File -Encoding utf8` or `Set-Content -Encoding utf8` when writing temp files.
 
 ```powershell
-'{"text":"Albert here."}' | Out-File -Encoding utf8 "$env:TEMP\chatmsg.json"
+'{"text":"Albert here."}' | Out-File -Encoding utf8 ".claude\tmp\chatmsg.json"
 ```
 
 ---
@@ -140,6 +140,24 @@ The Windows filesystem is accessible from WSL at `/mnt/c/Users/...`.
 
 ---
 
+## Temp files
+
+Use `.claude/tmp/` (inside the project working directory) for **all** collab scratch files — downloaded content, header dumps, chat message buffers, and any other temporary data. Create it at session start if it does not exist:
+
+```bash
+# Bash/WSL
+mkdir -p .claude/tmp
+```
+
+```powershell
+# PowerShell
+New-Item -ItemType Directory -Force -Path ".claude\tmp" | Out-Null
+```
+
+This keeps temp files project-scoped and avoids stale files from a previous session being silently picked up.
+
+---
+
 ## Connecting — step by step
 
 ### Bash/WSL (preferred)
@@ -167,22 +185,22 @@ Always write JSON to a temp file — never pass it inline.
 ### Bash/WSL
 
 ```bash
-printf '{"text":"Albert here. Message text goes here."}' > /tmp/chatmsg.json
+printf '{"text":"Albert here. Message text goes here."}' > .claude/tmp/chatmsg.json
 curl -s -X POST \
   -H "X-Agent-Secret: $SECRET" \
   -H "Content-Type: application/json" \
-  --data-binary @/tmp/chatmsg.json \
+  --data-binary @.claude/tmp/chatmsg.json \
   "https://sulfurous.aau.at/~collab/api/$PROJECT/chat"
 ```
 
 ### PowerShell
 
 ```powershell
-'{"text":"Albert here. Message text goes here."}' | Out-File -Encoding utf8 "$env:TEMP\chatmsg.json"
+'{"text":"Albert here. Message text goes here."}' | Out-File -Encoding utf8 ".claude\tmp\chatmsg.json"
 curl.exe -s -X POST `
   -H "X-Agent-Secret: $SECRET" `
   -H "Content-Type: application/json" `
-  --data-binary "@$env:TEMP\chatmsg.json" `
+  --data-binary "@.claude\tmp\chatmsg.json" `
   "https://sulfurous.aau.at/~collab/api/$PROJECT/chat"
 ```
 
@@ -195,11 +213,11 @@ curl.exe -s -X POST `
 ```bash
 curl -s \
   -H "X-Agent-Secret: $SECRET" \
-  -D /tmp/headers.txt \
-  -o /tmp/design.md \
+  -D .claude/tmp/headers.txt \
+  -o .claude/tmp/design.md \
   "https://sulfurous.aau.at/~collab/api/$PROJECT/file?p=design.md"
 
-VERSION=$(grep -i "^X-File-Version" /tmp/headers.txt | tr -d '\r' | awk '{print $2}')
+VERSION=$(grep -i "^X-File-Version" .claude/tmp/headers.txt | tr -d '\r' | awk '{print $2}')
 ```
 
 ### PowerShell
@@ -223,7 +241,7 @@ curl -s -X PUT \
   -H "X-Agent-Secret: $SECRET" \
   -H "X-Expected-Version: $VERSION" \
   -H "Content-Type: text/plain" \
-  --data-binary @/tmp/design.md \
+  --data-binary @.claude/tmp/design.md \
   "https://sulfurous.aau.at/~collab/api/$PROJECT/file?p=design.md"
 ```
 
@@ -234,7 +252,7 @@ curl.exe -s -X PUT `
   -H "X-Agent-Secret: $SECRET" `
   -H "X-Expected-Version: $VERSION" `
   -H "Content-Type: text/plain" `
-  --data-binary "@$env:TEMP\design.md" `
+  --data-binary "@.claude\tmp\design.md" `
   "https://sulfurous.aau.at/~collab/api/$PROJECT/file?p=design.md"
 ```
 

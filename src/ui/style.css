@@ -11,6 +11,7 @@
     --success: #27ae60;
     --warn-bg: #fff8e0;
     --code-bg: #f0f0f0;
+    --foreign: #555;
     --shadow: 0 1px 3px rgba(0,0,0,0.08);
 }
 
@@ -27,6 +28,7 @@
     --success: #2ecc71;
     --warn-bg: #3a3520;
     --code-bg: #1a1d23;
+    --foreign: #6e727a;
     --shadow: 0 1px 3px rgba(0,0,0,0.3);
 }
 
@@ -104,6 +106,7 @@ footer {
 }
 
 h1 { margin-top: 0; font-size: 1.6rem; }
+.project-owner { margin: -0.4rem 0 0.5rem; }
 h2 { font-size: 1.25rem; margin-top: 1.5rem; }
 h3 { font-size: 1.05rem; }
 
@@ -231,6 +234,13 @@ td.center, th.center { text-align: center; }
     border-radius: 3px;
 }
 
+/* Agents created by another user: secret hidden ("not your agent", plain
+   italic text, not styled as a secret value) or, for admins, shown together
+   with the remove button in the same grey. */
+.foreign { color: var(--foreign); }
+.foreign-note { color: var(--foreign); font-style: italic; }
+button.danger.foreign { background: var(--foreign); color: #fff; }
+
 .chat-box {
     max-height: 60vh;
     overflow-y: auto;
@@ -270,6 +280,25 @@ td.center, th.center { text-align: center; }
     word-break: break-word;
     max-height: 60vh;
     overflow-y: auto;
+}
+
+.img-view {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 1rem;
+}
+
+.img-view img {
+    max-width: 100%;
+    max-height: 60vh;
+    object-fit: contain;
+    background:
+        linear-gradient(45deg, var(--border) 25%, transparent 25%) -8px 0/16px 16px,
+        linear-gradient(-45deg, var(--border) 25%, transparent 25%) -8px 0/16px 16px,
+        linear-gradient(45deg, transparent 75%, var(--border) 75%) 0 0/16px 16px,
+        linear-gradient(-45deg, transparent 75%, var(--border) 75%) 0 0/16px 16px;
+    background-color: var(--code-bg);
 }
 
 .deleted { color: var(--fg-muted); text-decoration: line-through; }
@@ -379,6 +408,8 @@ body.auth-page {
 
 .auth-card form { display: flex; flex-direction: column; gap: 0.75rem; }
 .auth-card label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; }
+.auth-card label.auth-remember { flex-direction: row; align-items: center; gap: 0.5rem; font-weight: normal; cursor: pointer; }
+.auth-card label.auth-remember input[type="checkbox"] { width: 1rem; height: 1rem; flex-shrink: 0; cursor: pointer; margin: 0; }
 .auth-card input {
     padding: 0.55rem 0.7rem;
     border: 1px solid var(--border);
@@ -472,3 +503,647 @@ body.auth-page {
     color: var(--fg-muted);
 }
 .about-version { text-align: right; margin-top: 0.5rem; }
+
+/* ---- View toggle buttons ---- */
+.view-toggle { padding: 0.2rem 0.65rem; font-size: 0.82rem; }
+.view-toggle-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+}
+.view-toggle-active:hover { background: var(--accent); opacity: 0.9; }
+
+/* ---- Markdown view ---- */
+.md-view {
+    font-family: var(--font, system-ui, sans-serif);
+    font-size: 0.92rem;
+    line-height: 1.6;
+    white-space: normal;
+    word-break: normal;
+    padding: 1rem 1.25rem;
+}
+.md-view h1, .md-view h2, .md-view h3,
+.md-view h4, .md-view h5, .md-view h6 {
+    margin: 1rem 0 0.4rem;
+    font-weight: 700;
+    line-height: 1.3;
+}
+.md-view h1 { font-size: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.25rem; }
+.md-view h2 { font-size: 1.25rem; border-bottom: 1px solid var(--border); padding-bottom: 0.2rem; }
+.md-view h3 { font-size: 1.1rem; }
+.md-view p  { margin: 0.5rem 0; }
+.md-view ul, .md-view ol { margin: 0.5rem 0 0.5rem 1.5rem; }
+.md-view li { margin: 0.2rem 0; }
+.md-view blockquote {
+    border-left: 3px solid var(--accent, #888);
+    margin: 0.5rem 0;
+    padding: 0.25rem 0.75rem;
+    color: var(--fg-muted);
+}
+.md-view hr { border: none; border-top: 1px solid var(--border); margin: 1rem 0; }
+.md-view a  { color: var(--accent); }
+.md-view strong { font-weight: 700; }
+.md-view em     { font-style: italic; }
+.md-view del    { text-decoration: line-through; color: var(--fg-muted); }
+.md-view pre.md-code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.6rem 0.75rem;
+    overflow-x: auto;
+    margin: 0.5rem 0;
+    font-size: 0.83rem;
+}
+.md-view code.md-inline-code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0.1em 0.35em;
+    font-size: 0.85em;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ---- txt view ---- */
+.txt-view {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Editable text view (textarea) — inherits .file-content/.txt-view box, just
+   needs to behave like a plain text box instead of a bordered form control. */
+.txt-edit {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 40vh;
+    border: none;
+    outline: none;
+    resize: vertical;
+    background: transparent;
+    color: inherit;
+}
+
+/* ---- Hex editor ---- */
+.hex-editor-container {
+    overflow-x: auto;
+    padding: 0.5rem 0.75rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+}
+.hex-table { border-collapse: collapse; white-space: pre; }
+.hex-table tr:hover td { background: var(--hover-bg, rgba(128,128,128,0.06)); }
+.hex-addr  { color: var(--fg-muted); padding-right: 1.2rem; user-select: none; }
+.hex-bytes { padding-right: 1rem; letter-spacing: 0.02em; }
+.hex-ascii { color: var(--fg-muted); border-left: 1px solid var(--border); padding-left: 0.75rem; }
+.hex-sep   { display: inline-block; width: 0.75rem; }
+.hex-cell  { display: inline-block; min-width: 1.6em; }
+.hex-pad   { visibility: hidden; }
+.hex-editable {
+    cursor: text;
+    border-radius: 2px;
+    outline: none;
+}
+.hex-editable:focus {
+    background: var(--accent, #3b82f6);
+    color: #fff;
+    border-radius: 2px;
+}
+.hex-changed {
+    background: var(--warn-bg, #fffbeb);
+    color: var(--warn-fg, #b45309);
+    border-radius: 2px;
+}
+
+/* ---- Markdown tables ---- */
+.md-view table.md-table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.75rem 0;
+    font-size: 0.88rem;
+}
+.md-view table.md-table th,
+.md-view table.md-table td {
+    border: 1px solid var(--border);
+    padding: 0.35rem 0.65rem;
+    text-align: left;
+}
+.md-view table.md-table thead tr {
+    background: var(--code-bg);
+    font-weight: 700;
+}
+.md-view table.md-table tbody tr:nth-child(even) {
+    background: var(--hover-bg, rgba(128,128,128,0.04));
+}
+
+/* --- Color swatch (header) ------------------------------------------- */
+/* Same shape/size as #theme-toggle, but the background carries the
+   user's current color. Left-click = new color, right-click = previous. */
+#color-swatch {
+    width: 1.65rem;
+    height: 1.65rem;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    background: var(--bg-alt);   /* fallback when no color set yet */
+    font-size: 0;                /* hide any accidental text content */
+    transition: transform 0.08s ease-out;
+}
+#color-swatch:hover  { transform: scale(1.05); }
+#color-swatch:active { transform: scale(0.95); }
+
+/* ====================================================================
+   Kanban board — Phase 2.3 read-only styles
+   ==================================================================== */
+
+.kanban-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.75rem;
+}
+.kanban-bar .kanban-refresh {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 0.2rem 0.55rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+.kanban-bar .kanban-refresh:hover { background: var(--bg-alt); }
+
+.kanban-board {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.6rem;
+}
+
+.kanban-wp {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    min-width: 0;   /* allow shrinking */
+}
+.kanban-wp-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+}
+.kanban-wp-index {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--fg-muted);
+    letter-spacing: 0.5px;
+}
+.kanban-wp-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.kanban-wp-tasks {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+.kanban-wp-empty {
+    font-style: italic;
+    font-size: 0.8rem;
+    padding: 0.25rem 0.5rem;
+}
+
+/* Parallel group: dashed wrapper, tighter task spacing inside. */
+.kanban-task-group {
+    border: 1px dashed var(--border);
+    border-radius: 5px;
+    padding: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    background: rgba(128,128,128,0.04);
+}
+
+/* --- Task card ------------------------------------------------------ */
+.kanban-task {
+    border-radius: 4px;
+    padding: 0.35rem 0.45rem;
+    font-size: 0.78rem;
+    line-height: 1.25;
+    color: #111;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+    cursor: default;
+    /* default background is overridden by inline style from JS (actor_color);
+       unpinned-human tasks fall back to the rule below. */
+}
+.kanban-task.k-actor-unpinned {
+    background: #C9A37B;   /* warm neutral for "any human" */
+}
+
+.k-task-head {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-weight: 700;
+}
+.k-state-icon { font-size: 0.85rem; }
+.k-task-label {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
+}
+.k-task-cap {
+    font-size: 0.7rem;
+    opacity: 0.6;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+.k-task-par {
+    margin-left: auto;
+    background: rgba(0,0,0,0.08);
+    border: 1px solid rgba(0,0,0,0.15);
+    padding: 0 0.3rem;
+    margin-right: 0.1rem;
+    cursor: pointer;
+    color: inherit;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
+    font-weight: 700;
+    line-height: 1.1;
+    opacity: 0.85;
+    border-radius: 3px;
+    transition: opacity 0.1s, background 0.1s;
+    min-width: 1.4rem;
+    text-align: center;
+    letter-spacing: -0.05em;
+}
+.k-task-par:hover:not(:disabled) {
+    opacity: 1;
+    background: rgba(255,255,255,0.55);
+}
+.k-task-par-on {
+    opacity: 1;
+    background: rgba(255,255,255,0.55);
+    border-color: rgba(0,0,0,0.3);
+}
+.k-task-par:disabled {
+    cursor: default;
+    opacity: 0;
+    pointer-events: none;
+}
+.k-task-name {
+    margin-top: 0.2rem;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+.k-task-claimer,
+.k-task-comments {
+    margin-top: 0.2rem;
+    font-size: 0.72rem;
+    opacity: 0.85;
+}
+
+/* --- State-driven visual treatment --------------------------------- */
+/* open / ready / claimed / partly / done. Background carries actor color
+   from JS; we modulate it with filter so we don't have to know the hex. */
+
+.kanban-task.k-state-open,
+.kanban-task.k-state-ready {
+    filter: saturate(0.5) brightness(0.97);
+}
+.kanban-task.k-state-open {
+    opacity: 0.7;
+}
+.kanban-task.k-state-claimed {
+    /* full saturation — actor color shines */
+    box-shadow: 0 1px 3px rgba(0,0,0,0.18);
+}
+.kanban-task.k-state-done {
+    border: 2px solid #2E8B3D;
+    padding: calc(0.35rem - 1px) calc(0.45rem - 1px);
+    filter: saturate(0.4) brightness(1.02);
+}
+.kanban-task.k-state-partly {
+    border: 2px dashed #D88B30;
+    padding: calc(0.35rem - 1px) calc(0.45rem - 1px);
+}
+
+/* Dark mode: lighten card text since most actor colors are light/saturated.
+   Body text on a saturated hue still needs to be dark for legibility, so
+   we keep color: #111 globally but tweak the muted ones. */
+[data-theme="dark"] .kanban-task.k-actor-unpinned {
+    background: #8C6F4E;
+    color: #f4f4f4;
+}
+[data-theme="dark"] .kanban-task.k-state-done   { border-color: #4FCB67; }
+[data-theme="dark"] .kanban-task.k-state-partly { border-color: #F0A040; }
+
+/* --- Phase 3.1 add buttons ----------------------------------------- */
+/* [+ Add task] sits at the bottom of every WP's task list — subdued
+   dashed button that fills the column width. */
+.kanban-add-task {
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: 4px;
+    color: var(--fg-muted);
+    padding: 0.3rem 0.4rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+    text-align: center;
+    transition: background 0.1s ease-out, color 0.1s ease-out;
+}
+.kanban-add-task:hover {
+    background: var(--hover-bg, rgba(128,128,128,0.08));
+    color: var(--fg);
+}
+
+/* [+ New WP] is a column-shaped placeholder at the end of the grid —
+   same min-height as the empty Phase-0 column so the grid stays even. */
+.kanban-add-wp {
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    color: var(--fg-muted);
+    padding: 0.5rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    min-height: 4rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s ease-out, color 0.1s ease-out;
+}
+.kanban-add-wp:hover {
+    background: var(--hover-bg, rgba(128,128,128,0.08));
+    color: var(--fg);
+}
+
+/* --- Phase 3.2: inline rename input -------------------------------- */
+.kanban-rename-input {
+    font: inherit;
+    color: inherit;
+    background: rgba(255,255,255,0.85);
+    border: 1px solid var(--accent, #4080d0);
+    border-radius: 3px;
+    padding: 0.15rem 0.3rem;
+    margin: 0;
+    width: 100%;
+    box-sizing: border-box;
+    outline: none;
+}
+[data-theme="dark"] .kanban-rename-input {
+    background: rgba(0,0,0,0.5);
+    color: #fafafa;
+}
+/* While the task name is in edit mode, drop the line-clamp so the full
+   input is visible and comfortable to type into. */
+.k-task-name.editing {
+    display: block;
+    overflow: visible;
+    -webkit-line-clamp: unset;
+    margin-top: 0.25rem;
+}
+/* Empty task name is rendered as a placeholder; visually muted. */
+.k-task-name-empty {
+    font-style: italic;
+    opacity: 0.55;
+    font-weight: 400;
+}
+
+/* --- Phase 3.3: edit button + task editor modal ---------------------- */
+
+/* Small ✎ button in the task card header — same visual weight as the
+   parallel toggle. Sits between .k-task-par and .k-task-cap. */
+.k-task-edit {
+    background: transparent;
+    border: none;
+    padding: 0 0.2rem;
+    margin-right: 0.1rem;
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+    font-size: 0.85rem;
+    line-height: 1;
+    opacity: 0.45;
+    border-radius: 3px;
+    transition: opacity 0.1s, background 0.1s;
+}
+.k-task-edit:hover {
+    opacity: 1;
+    background: rgba(255,255,255,0.25);
+}
+
+/* The task editor itself needs more horizontal room than the default
+   28rem modal, mostly so the description textarea is comfortable. */
+.kanban-task-modal {
+    max-width: 34rem;
+}
+.modal-card textarea {
+    font: inherit;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    border-radius: 4px;
+    resize: vertical;
+    min-height: 5rem;
+    width: 100%;
+    box-sizing: border-box;
+}
+.modal-card label {
+    font-size: 0.85rem;
+    color: var(--fg-muted);
+    margin-top: 0.25rem;
+}
+
+/* Read-only comments list inside the editor */
+.kt-comments {
+    max-height: 12rem;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.4rem 0.5rem;
+    background: var(--bg);
+    font-size: 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+.kt-comment {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.35rem;
+}
+.kt-comment:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+}
+.kt-comment-meta {
+    font-size: 0.72rem;
+    margin-bottom: 0.15rem;
+}
+.kt-comment-text {
+    white-space: pre-wrap;
+    line-height: 1.4;
+}
+
+/* --- Phase 3.4: context menu ---------------------------------------- */
+
+.k-ctx-menu {
+    position: fixed;
+    z-index: 200;
+    min-width: 11rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+    padding: 0.25rem 0;
+    font-size: 0.85rem;
+    color: var(--fg);
+    user-select: none;
+}
+.k-ctx-submenu {
+    /* nested menus positioned by JS (left:100%, top:0 relative to the
+       item that opened them). They float out beside the parent. */
+    position: absolute;
+}
+.k-ctx-item {
+    padding: 0.35rem 0.75rem;
+    cursor: pointer;
+    position: relative;
+    white-space: nowrap;
+}
+.k-ctx-item:hover:not(.k-ctx-disabled) {
+    background: var(--bg-alt, rgba(127,127,127,0.18));
+}
+.k-ctx-item.k-ctx-disabled {
+    color: var(--fg-muted);
+    cursor: default;
+    opacity: 0.6;
+}
+.k-ctx-item.k-ctx-danger:not(.k-ctx-disabled) {
+    color: #c43a2c;
+}
+.k-ctx-item.k-ctx-danger:not(.k-ctx-disabled):hover {
+    background: rgba(196,58,44,0.12);
+}
+[data-theme="dark"] .k-ctx-item.k-ctx-danger:not(.k-ctx-disabled) {
+    color: #ff7a6b;
+}
+[data-theme="dark"] .k-ctx-item.k-ctx-danger:not(.k-ctx-disabled):hover {
+    background: rgba(255,122,107,0.15);
+}
+.k-ctx-sep {
+    height: 1px;
+    background: var(--border);
+    margin: 0.2rem 0.4rem;
+}
+.k-ctx-has-sub {
+    /* Visually flag that this item has a flyout submenu. The arrow is
+       baked into the label text in JS (' ›'), so the styling here is just
+       for the hover-keep-submenu-open behaviour: when leaving the item,
+       the submenu stays under the cursor because it's a child element. */
+}
+
+/* --- Phase 3.5: drag-and-drop indicators ---------------------------- */
+
+/* The card / column being dragged: dim it so it's clear the visual stays
+   anchored at its origin while the drag ghost shows the move. */
+.kanban-task.k-dragging,
+.kanban-wp.k-dragging {
+    opacity: 0.4;
+}
+
+/* WP column highlighted while a task drag is hovering over it. */
+.kanban-wp.k-dropzone {
+    outline: 2px dashed var(--accent, #4080d0);
+    outline-offset: -2px;
+}
+
+/* WP header is draggable — show grab cursor on hover. */
+.kanban-wp-head {
+    cursor: grab;
+}
+.kanban-wp-head:active {
+    cursor: grabbing;
+}
+/* But the editable name span overrides cursor to 'text' via makeEditable;
+   we leave that as-is so users know they can double-click it. */
+
+/* Task cards are draggable too — but we only show the grab cursor on the
+   card body, not on the interactive header buttons. */
+.kanban-task {
+    cursor: grab;
+}
+.kanban-task:active {
+    cursor: grabbing;
+}
+/* Don't override cursor on the interactive bits inside the card. */
+.k-task-par, .k-task-edit {
+    cursor: pointer;
+}
+
+/* The drop indicator — a single shared element positioned by JS. */
+.kanban-drop-indicator {
+    position: fixed;
+    z-index: 150;
+    background: var(--accent, #4080d0);
+    border-radius: 2px;
+    box-shadow: 0 0 6px rgba(64,128,208,0.7);
+    pointer-events: none;
+}
+.kanban-drop-indicator-horizontal {
+    /* horizontal line between task cards */
+}
+/* --- Phase 4: claim/release/state primary-action button --------------- */
+
+.k-task-primary {
+    margin-top: 0.35rem;
+    width: 100%;
+    padding: 0.18rem 0.4rem;
+    border: 1px solid rgba(0,0,0,0.25);
+    border-radius: 3px;
+    background: rgba(255,255,255,0.55);
+    color: inherit;
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: center;
+    transition: background 0.1s, transform 0.05s;
+}
+.k-task-primary:hover {
+    background: rgba(255,255,255,0.85);
+}
+.k-task-primary:active {
+    transform: translateY(1px);
+}
+.k-task-done-btn {
+    background: rgba(46,139,61,0.22);
+    border-color: rgba(46,139,61,0.6);
+}
+.k-task-done-btn:hover {
+    background: rgba(46,139,61,0.4);
+}
+[data-theme="dark"] .k-task-primary {
+    background: rgba(255,255,255,0.18);
+    border-color: rgba(255,255,255,0.3);
+    color: #f4f4f4;
+}
+[data-theme="dark"] .k-task-primary:hover {
+    background: rgba(255,255,255,0.32);
+}

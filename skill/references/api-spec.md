@@ -486,6 +486,108 @@ Returns when each agent was last seen. Any agent with a valid project secret can
 
 ---
 
+### 5.11 Kanban — overview
+
+Available only when the project's `meta.json` has `has_kanban: true`. The board is
+stored in `kanban.json` (server-side; not reachable via the file endpoints) and
+versioned by an integer `kanban_version`. All mutating calls take
+`expected_version` and use the same optimistic-concurrency model as files: a
+mismatch returns `409` with the current board.
+
+Agents have a **class** (`manager` or `worker`, from their `meta.json` record;
+the owner agent is implicitly a manager). Workers may read/claim/release/state/
+comment; only managers may call `kanban-save`. Guest workers (5.17) have worker
+rights.
+
+Task identity in claims/comments is the agent's stable `id` (`ag_…`, or
+`guest_<n>` for guests) — **never the secret** — plus a display name
+(`claimed_by_name`, comment `by_name`).
+
+Task states: `open` (blocked by an earlier task), `ready` (claimable),
+`claimed`, `partly` (claim released, resumable), `done`. Claims expire after
+`KANBAN_CLAIM_TTL_AGENT` (1 h) and revert to `ready`.
+
+### 5.12 `GET /<project>/kanban` — Read board
+
+Sweeps expired claims, then returns the computed board.
+
+**Response 200:**
+```json
+{
+  "kanban_version": 71,
+  "wps": [
+    { "id": "wp_001", "name": "Phase 0", "tasks": [
+      { "id": "t_002", "name": "…", "capability": "agent", "state": "ready",
+        "claimed_by": null, "claimed_by_name": null, "comments": [] }
+    ] }
+  ],
+  "next_wp_id": 4,
+  "next_task_id": 11
+}
+```
+
+### 5.13 `POST /<project>/kanban-claim` — Claim a task
+
+**Body:** `{ "task_id": "t_002", "expected_version": 71 }`
+Claims a `ready` (or own already-`claimed`) task. Errors: `task_not_found` (404),
+`task_not_ready` (409, still `open`), `already_claimed` (409, with `claimed_by` /
+`claimed_by_name`), `version_conflict` (409, with `current`).
+
+**Response 200:** `{ "kanban_version": 72, "task": { … } }`
+
+### 5.14 `POST /<project>/kanban-release` — Release a claim
+
+**Body:** `{ "task_id": "t_002", "expected_version": 72 }`
+Releases your claim (state → `ready`). Managers/owner may release anyone's claim;
+a worker releasing another's claim gets `403 forbidden`. `not_claimed` (409) if
+the task isn't claimed.
+
+### 5.15 `POST /<project>/kanban-state` — Change state
+
+**Body:** `{ "task_id": "t_002", "new_state": "done", "comment": "optional",
+"expected_version": 72 }`
+Allowed transitions: `claimed→partly|done` (claimer or a manager only),
+`partly→claimed`, `done→partly`, `ready→claimed`. Anything else →
+`invalid_transition` (409). `done` records `completed_by`/`completed_by_name`;
+`partly`/`done` clear the active claim. A non-empty `comment` is appended.
+
+### 5.16 `POST /<project>/kanban-comment` — Comment
+
+**Body:** `{ "task_id": "t_002", "text": "…", "expected_version": 72 }`
+Appends `{ by, by_name, at, text }` to the task. Any-on-any (any member may
+comment on any task); the skill teaches agents to stay on their own/related tasks.
+
+### 5.17 `POST /<project>/kanban-save` — Edit structure *(managers only)*
+
+**Body:** `{ "wps": [ … full board … ], "expected_version": 72,
+"next_wp_id": 4, "next_task_id": 11 }`
+Replaces the whole `wps` array (GET → mutate → save). Schema-validated; bad input
+→ `invalid_schema` (400). Worker calling this → `403 forbidden`.
+
+### 5.18 Guest connect — `GET /` with the shared guest secret
+
+A guest-worker secret is not tied to a project. `GET /` (no project) round-robins
+the guest to the next project with `guest_workers: true` and ≥1 claimable agent
+task, assigns a recyclable name-slot (`Xavier`, `Xavier2`, …) and an ephemeral
+session **token**:
+
+```json
+{
+  "assigned": true, "guest": true,
+  "name": "Xavier", "role": "Guest worker", "class": "worker",
+  "token": "gw_aee9…", "owner": "…@aau.at", "project": "test2",
+  "has_kanban": true, "available_task_count": 5, "instructions": "…"
+}
+```
+
+`{ "assigned": false }` means no guest work is available. After connect the guest
+authenticates **with the token** (`X-Agent-Secret: gw_…`) and addresses the
+assigned project by slug; the bare shared secret is rejected on any non-connect
+call (`400 guest_connect_required`). Tokens carry a 1 h idle TTL. The guest has
+worker rights only.
+
+---
+
 ## 6. State Machine Summary
 
 How file operations affect `reads[agent][path]` and `versions[path]`:

@@ -59,27 +59,60 @@ if (empty($segments) || $segments[0] === '') {
 
 // Resolve (owner, project, dir) from secret. Project name is an optional cross-check.
 $resolved = find_project_by_secret((string) $secret, $project);
+
 if (!$resolved) {
-    respond(401, ['error' => 'unauthorized', 'message' => 'Invalid secret']);
+    // --- Guest worker paths -------------------------------------------------
+    if (is_guest_secret((string) $secret)) {
+        // The bare shared guest secret is only valid for connect: GET / .
+        if ($_SERVER['REQUEST_METHOD'] === 'GET' && $endpoint === '' && $project === '') {
+            handleGuestConnect();   // round-robin assignment; responds and exits
+        }
+        respond(400, ['error' => 'guest_connect_required',
+            'message' => 'Connect first: GET / with the guest secret returns a session token to use as X-Agent-Secret.']);
+    }
+
+    // A guest session token?
+    $gslot = guest_resolve_token((string) $secret);
+    if ($gslot === null) {
+        respond(401, ['error' => 'unauthorized', 'message' => 'Invalid secret']);
+    }
+
+    // Synthesize a worker context bound to the token's assigned project.
+    $projectDir = $gslot['dir'];
+    $project    = $gslot['project'];
+    $meta       = meta_load($projectDir);
+    if (empty($meta['guest_workers'])) {
+        respond(403, ['error' => 'guest_not_open',
+            'message' => 'This project no longer accepts guest workers. Reconnect with GET /.']);
+    }
+    $agent = [
+        'name'   => $gslot['name'],
+        'role'   => 'Guest worker',
+        'class'  => 'worker',
+        'id'     => 'guest_' . $gslot['n'],
+        'secret' => (string) $secret,
+        'guest'  => true,
+    ];
+    // Guest presence lives in guest-workers.json (slot last_seen); do not write
+    // into the project's versions.json.
+} else {
+    // --- Normal registered agent -------------------------------------------
+    if ($project === '') {
+        $project = $resolved['project'];
+    }
+    $projectDir = $resolved['dir'];
+    $meta       = $resolved['meta'];
+
+    $agent = $meta['agents'][$secret];
+    $agent['secret'] = $secret;
+
+    // Update last_seen on every authenticated request.
+    withLock($projectDir, function() use ($projectDir, $secret) {
+        $v = readVersions($projectDir);
+        $v['last_seen'][$secret] = nowIso();
+        writeVersions($projectDir, $v);
+    });
 }
-
-// If no project was given in the URL, fill it in from the resolved data.
-if ($project === '') {
-    $project = $resolved['project'];
-}
-
-$projectDir = $resolved['dir'];
-$meta       = $resolved['meta'];
-
-$agent = $meta['agents'][$secret];
-$agent['secret'] = $secret;
-
-// Update last_seen on every authenticated request.
-withLock($projectDir, function() use ($projectDir, $secret) {
-    $v = readVersions($projectDir);
-    $v['last_seen'][$secret] = nowIso();
-    writeVersions($projectDir, $v);
-});
 
 $method = $_SERVER['REQUEST_METHOD'];
 $route = "$method $endpoint" . ($sub ? "/$sub" : '');
@@ -96,6 +129,12 @@ switch ($route) {
     case 'POST chat/seen':      handleChatSeen($projectDir, $agent); break;
     case 'POST files/seen':     handleFilesSeen($projectDir, $agent); break;
     case 'GET presence':        handlePresence($projectDir, $meta); break;
+    case 'GET kanban':          handleGetKanban($projectDir, $agent); break;
+    case 'POST kanban-claim':   handleKanbanClaim($projectDir, $agent); break;
+    case 'POST kanban-release': handleKanbanRelease($projectDir, $agent); break;
+    case 'POST kanban-state':   handleKanbanState($projectDir, $agent); break;
+    case 'POST kanban-comment': handleKanbanComment($projectDir, $agent); break;
+    case 'POST kanban-save':    handleKanbanSave($projectDir, $agent); break;
     default:
         respond(404, ['error' => 'not_found', 'message' => "No route: $route"]);
 }
@@ -119,8 +158,9 @@ function handleConnect(string $projectDir, array $meta, array $agent, string $pr
             'project'      => $project,          // URL slug — use this in all subsequent calls
             'display_name' => $meta['name'],      // human-readable project name
             'description'  => $meta['description'],
-            'agent'        => ['name' => $agent['name'], 'role' => $agent['role']],
+            'agent'        => ['name' => $agent['name'], 'role' => $agent['role'], 'class' => $agent['class'] ?? 'manager'],
             'design_doc'   => 'design.md',
+            'has_kanban'   => project_has_kanban($projectDir),
             'file_count'   => $fileCount,
             'chat_unread'  => $chatUnread,
             'chat_total'   => $chatTotal,
@@ -591,6 +631,298 @@ function handlePresence(string $projectDir, array $meta): void {
     respond(200, ['agents' => $out]);
 }
 
+// --- Guest workers ---------------------------------------------------------
+
+function handleGuestConnect(): void {
+    $a = guest_assign();
+    if (empty($a['assigned'])) {
+        respond(200, [
+            'assigned' => false,
+            'message'  => 'No guest work available right now. Reconnect later with GET /.',
+            'server_time' => now_iso(),
+        ]);
+    }
+    $dir  = $a['dir'];
+    $meta = meta_load($dir);
+    respond(200, [
+        'assigned'             => true,
+        'guest'                => true,
+        'name'                 => $a['name'],
+        'role'                 => 'Guest worker',
+        'class'                => 'worker',
+        'token'                => $a['token'],
+        'owner'                => $a['owner'],
+        'project'              => $a['project'],
+        'display_name'         => $meta['display_name'] ?? $a['project'],
+        'description'          => $meta['description'] ?? '',
+        'design_doc'           => 'design.md',
+        'has_kanban'           => true,
+        'available_task_count' => $a['available'],
+        'instructions'         => 'You are a guest worker. From now on send the token as your X-Agent-Secret and address the assigned project in the path, e.g. GET /' . $a['project']
+                                . '/kanban. Claim a ready task, work it, then mark it done. If you must stop before finishing, set the task to "partly" with a comment so the next worker can continue. You start fresh on every connect.',
+        'server_time'          => now_iso(),
+    ]);
+}
+
+// --- Kanban (agent-facing) -------------------------------------------------
+//
+// Mirrors the human UI kanban endpoints (src/ui/api.php) but authed by the
+// agent secret. owner/project come from the resolved secret, not the body.
+// Reuses the shared kanban_* helpers in lib.php. claimed_by/comment authors are
+// stored as the agent's stable id (NEVER the secret) + a display name.
+
+/** Stable, non-secret id for the calling agent (falls back to a hash of the
+ *  secret if the agent predates the class/id migration). */
+function agentId(array $agent): string {
+    if (!empty($agent['id'])) return (string) $agent['id'];
+    return 'ag_' . substr(hash('sha256', (string) ($agent['secret'] ?? '')), 0, 8);
+}
+
+/** Managers (and the owner/admin agent) may edit board structure. */
+function agentIsManager(array $agent): bool {
+    return (($agent['class'] ?? 'manager') === 'manager') || !empty($agent['admin']);
+}
+
+function kanbanBody(): array {
+    $d = json_decode((string) file_get_contents('php://input'), true);
+    return is_array($d) ? $d : [];
+}
+
+function respondKanbanConflict(string $projectDir, RuntimeException $e): void {
+    $cur = (int) substr($e->getMessage(), strlen('KANBAN_VERSION_CONFLICT:'));
+    $latest = kanban_load($projectDir);
+    kanban_compute_states($latest);
+    respond(409, [
+        'error'           => 'version_conflict',
+        'message'         => "Kanban was modified. Current version is $cur.",
+        'current_version' => $cur,
+        'current'         => $latest,
+    ]);
+}
+
+function handleGetKanban(string $projectDir, array $agent): void {
+    if (!project_has_kanban($projectDir)) {
+        respond(404, ['error' => 'kanban_disabled',
+            'message' => 'Kanban is not enabled for this project']);
+    }
+    // Lock once to sweep expired claims; no structural change.
+    [$data, ] = kanban_with_lock($projectDir, null, function(array &$d) {
+        return ['_no_change' => true];
+    });
+    kanban_compute_states($data);
+    respond(200, [
+        'kanban_version' => $data['kanban_version'],
+        'wps'            => $data['wps'],
+        'next_wp_id'     => $data['next_wp_id']   ?? null,
+        'next_task_id'   => $data['next_task_id'] ?? null,
+    ]);
+}
+
+function handleKanbanClaim(string $projectDir, array $agent): void {
+    if (!project_has_kanban($projectDir)) respond(404, ['error' => 'kanban_disabled']);
+    $body = kanbanBody();
+    $taskId   = (string) ($body['task_id'] ?? '');
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    if ($taskId === '') respond(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+
+    $aid = agentId($agent); $aname = $agent['name'] ?? 'agent';
+    try {
+        [$saved, $result] = kanban_with_lock($projectDir, $expected,
+                function(array &$d) use ($taskId, $aid, $aname) {
+            $task = &kanban_find_task($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            $state = $task['state'] ?? 'open';
+            if ($state === 'open') return ['_no_change' => true, 'error' => 'task_not_ready'];
+            if ($state === 'claimed') {
+                $existing = $task['claimed_by'] ?? null;
+                if ($existing !== null && $existing !== $aid) {
+                    return ['_no_change' => true, 'error' => 'already_claimed',
+                            'claimed_by' => $existing,
+                            'claimed_by_name' => $task['claimed_by_name'] ?? null,
+                            'claimed_at' => $task['claimed_at'] ?? null];
+                }
+            }
+            $task['state']           = 'claimed';
+            $task['claimed_by']      = $aid;
+            $task['claimed_by_name'] = $aname;
+            $task['claimed_at']      = now_iso();
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            respond($result['error'] === 'task_not_found' ? 404 : 409, $result);
+        }
+        respond(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => kanban_find_task($saved, $taskId)]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) respondKanbanConflict($projectDir, $e);
+        throw $e;
+    }
+}
+
+function handleKanbanRelease(string $projectDir, array $agent): void {
+    if (!project_has_kanban($projectDir)) respond(404, ['error' => 'kanban_disabled']);
+    $body = kanbanBody();
+    $taskId   = (string) ($body['task_id'] ?? '');
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    if ($taskId === '') respond(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+
+    $aid = agentId($agent); $isPriv = agentIsManager($agent);
+    try {
+        [$saved, $result] = kanban_with_lock($projectDir, $expected,
+                function(array &$d) use ($taskId, $aid, $isPriv) {
+            $task = &kanban_find_task($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            if (($task['state'] ?? '') !== 'claimed') return ['_no_change' => true, 'error' => 'not_claimed'];
+            $cb = $task['claimed_by'] ?? null;
+            if ($cb !== $aid && !$isPriv) {
+                return ['_no_change' => true, 'error' => 'forbidden',
+                        'message' => 'Only the claimer or a manager can release'];
+            }
+            $task['state']           = 'ready';
+            $task['claimed_by']      = null;
+            $task['claimed_by_name'] = null;
+            $task['claimed_at']      = null;
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            $code = $result['error'] === 'task_not_found' ? 404
+                  : ($result['error'] === 'forbidden' ? 403 : 409);
+            respond($code, $result);
+        }
+        respond(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => kanban_find_task($saved, $taskId)]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) respondKanbanConflict($projectDir, $e);
+        throw $e;
+    }
+}
+
+function handleKanbanState(string $projectDir, array $agent): void {
+    if (!project_has_kanban($projectDir)) respond(404, ['error' => 'kanban_disabled']);
+    $body = kanbanBody();
+    $taskId   = (string) ($body['task_id'] ?? '');
+    $newState = (string) ($body['new_state'] ?? '');
+    $comment  = isset($body['comment']) ? trim((string) $body['comment']) : '';
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    if ($taskId === '') respond(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+    if (!in_array($newState, ['partly', 'done', 'claimed'], true)) {
+        respond(400, ['error' => 'bad_request', 'message' => 'new_state must be one of: partly, done, claimed']);
+    }
+
+    $aid = agentId($agent); $aname = $agent['name'] ?? 'agent'; $isPriv = agentIsManager($agent);
+    try {
+        [$saved, $result] = kanban_with_lock($projectDir, $expected,
+                function(array &$d) use ($taskId, $newState, $comment, $aid, $aname, $isPriv) {
+            $task = &kanban_find_task($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            $cur = $task['state'] ?? 'open';
+
+            if ($cur === 'claimed' && ($newState === 'partly' || $newState === 'done')) {
+                $cb = $task['claimed_by'] ?? null;
+                if ($cb !== $aid && !$isPriv) {
+                    return ['_no_change' => true, 'error' => 'forbidden',
+                            'message' => 'Only the claimer can mark partly/done'];
+                }
+            } elseif ($cur === 'partly' && $newState === 'claimed') {
+            } elseif ($cur === 'done' && $newState === 'partly') {
+            } elseif ($cur === 'ready' && $newState === 'claimed') {
+            } else {
+                return ['_no_change' => true, 'error' => 'invalid_transition',
+                        'message' => "Cannot move from $cur to $newState"];
+            }
+
+            $task['state'] = $newState;
+            if ($newState === 'claimed') {
+                $task['claimed_by']      = $aid;
+                $task['claimed_by_name'] = $aname;
+                $task['claimed_at']      = now_iso();
+            } elseif ($newState === 'done') {
+                $task['completed_by']      = $aid;
+                $task['completed_by_name'] = $aname;
+                $task['completed_at']      = now_iso();
+                $task['claimed_by']        = null;
+                $task['claimed_by_name']   = null;
+                $task['claimed_at']        = null;
+            } elseif ($newState === 'partly') {
+                $task['claimed_by']      = null;
+                $task['claimed_by_name'] = null;
+                $task['claimed_at']      = null;
+            }
+            if ($comment !== '') {
+                if (!isset($task['comments']) || !is_array($task['comments'])) $task['comments'] = [];
+                $task['comments'][] = ['by' => $aid, 'by_name' => $aname, 'at' => now_iso(), 'text' => $comment];
+            }
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            $code = $result['error'] === 'task_not_found' ? 404
+                  : ($result['error'] === 'forbidden' ? 403 : 409);
+            respond($code, $result);
+        }
+        respond(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => kanban_find_task($saved, $taskId)]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) respondKanbanConflict($projectDir, $e);
+        throw $e;
+    }
+}
+
+function handleKanbanComment(string $projectDir, array $agent): void {
+    if (!project_has_kanban($projectDir)) respond(404, ['error' => 'kanban_disabled']);
+    $body = kanbanBody();
+    $taskId   = (string) ($body['task_id'] ?? '');
+    $text     = isset($body['text']) ? trim((string) $body['text']) : '';
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    if ($taskId === '') respond(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+    if ($text === '')   respond(400, ['error' => 'bad_request', 'message' => 'text required']);
+
+    $aid = agentId($agent); $aname = $agent['name'] ?? 'agent';
+    try {
+        [$saved, $result] = kanban_with_lock($projectDir, $expected,
+                function(array &$d) use ($taskId, $text, $aid, $aname) {
+            $task = &kanban_find_task($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            if (!isset($task['comments']) || !is_array($task['comments'])) $task['comments'] = [];
+            $task['comments'][] = ['by' => $aid, 'by_name' => $aname, 'at' => now_iso(), 'text' => $text];
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            respond($result['error'] === 'task_not_found' ? 404 : 409, $result);
+        }
+        respond(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => kanban_find_task($saved, $taskId)]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) respondKanbanConflict($projectDir, $e);
+        throw $e;
+    }
+}
+
+function handleKanbanSave(string $projectDir, array $agent): void {
+    if (!agentIsManager($agent)) {
+        respond(403, ['error' => 'forbidden',
+            'message' => 'Only manager agents can edit the board structure']);
+    }
+    if (!project_has_kanban($projectDir)) respond(404, ['error' => 'kanban_disabled']);
+    $body = kanbanBody();
+    $wps = $body['wps'] ?? null;
+    if (!is_array($wps)) respond(400, ['error' => 'bad_request', 'message' => 'wps must be an array']);
+    $err = kanban_validate_wps($wps);
+    if ($err !== null) respond(400, ['error' => 'invalid_schema', 'message' => $err]);
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+
+    try {
+        [$saved, ] = kanban_with_lock($projectDir, $expected, function(array &$d) use ($wps, $body) {
+            $d['wps'] = $wps;
+            if (isset($body['next_wp_id']))   $d['next_wp_id']   = (int) $body['next_wp_id'];
+            if (isset($body['next_task_id'])) $d['next_task_id'] = (int) $body['next_task_id'];
+        });
+        respond(200, ['kanban_version' => $saved['kanban_version'], 'wps' => $saved['wps']]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) respondKanbanConflict($projectDir, $e);
+        throw $e;
+    }
+}
+
 // --- Helpers ---------------------------------------------------------------
 
 function respond(int $status, array $body): void {
@@ -614,8 +946,35 @@ function validateFilePath(string $path): string {
     if (strpos($path, '..') !== false || strpos($path, "\0") !== false) {
         respond(400, ['error' => 'bad_request', 'message' => 'invalid path']);
     }
-    if (!preg_match('#^[a-zA-Z0-9._/-]+$#', $path)) {
-        respond(400, ['error' => 'bad_request', 'message' => 'path contains illegal characters']);
+    // Allowed characters — deliberately a positive whitelist so we don't
+    // accidentally permit URL-structural or shell-dangerous characters.
+    //
+    // Allowed:  a-z A-Z 0-9  . _ - /  SPACE ( ) + ! ' , @ = ~
+    //
+    // Blocked (reason):
+    //   %  — URL-encoding prefix; a name like "foo%2Fbar" would be
+    //         ambiguous after URL-decoding in some contexts.
+    //   #  — URL fragment separator; browsers silently truncate anything
+    //         after '#' in a URL.
+    //   ?  — URL query separator; same browser truncation problem.
+    //   * ? \ — shell glob / Windows path characters.
+    //   & ; | ` — shell operators / injection risk.
+    //   < > "  — shell redirection / forbidden on Windows filesystems.
+    //   NUL ..  — already caught above (path traversal / injection).
+    if (!preg_match('#^[a-zA-Z0-9._/\x20()+!\'\\,@=~-]+$#', $path)) {
+        respond(400, ['error' => 'bad_request', 'message' =>
+            'path contains illegal characters — allowed: '
+            . 'letters, digits, spaces, and: . _ - ( ) + ! \' , @ = ~ /']);
+    }
+    // Reject any path component that is empty (would mean '//'), purely
+    // whitespace, or has leading/trailing whitespace. This keeps the
+    // common case ("My File.txt") working while blocking invisible or
+    // ambiguous filenames like "  " or " foo".
+    foreach (explode('/', $path) as $comp) {
+        if ($comp === '' || trim($comp) === '' || $comp !== trim($comp)) {
+            respond(400, ['error' => 'bad_request', 'message' =>
+                'path component is empty or has leading/trailing whitespace']);
+        }
     }
     return $path;
 }
@@ -629,8 +988,16 @@ function readVersions(string $projectDir): array {
     if (!is_array($data)) {
         return ['files' => [], 'reads' => [], 'last_seen' => []];
     }
-    $data['files']     = $data['files']     ?? [];
-    $data['reads']     = $data['reads']     ?? [];
+    // Normalize: 'files' and 'reads' must be associative maps, not sequential arrays.
+    // A serialization bug can produce "files":[] on disk (json_encode([]) = "[]").
+    // Both [] and {} decode identically in PHP (assoc=true), so this check catches
+    // any non-assoc value: if non-empty and first key is an integer, reset to [].
+    $files = $data['files'] ?? [];
+    if (!is_array($files) || (!empty($files) && is_int(array_key_first($files)))) $files = [];
+    $reads = $data['reads'] ?? [];
+    if (!is_array($reads) || (!empty($reads) && is_int(array_key_first($reads)))) $reads = [];
+    $data['files']     = $files;
+    $data['reads']     = $reads;
     $data['last_seen'] = $data['last_seen'] ?? [];
     return $data;
 }
@@ -638,6 +1005,11 @@ function readVersions(string $projectDir): array {
 function writeVersions(string $projectDir, array $versions): void {
     $path = $projectDir . '/versions.json';
     $tmp = $path . '.tmp.' . getmypid();
+    // 'files' and 'reads' must always be JSON objects ({}) not arrays ([]).
+    // PHP encodes an empty array as [] but an empty stdClass as {}.
+    // A corrupt or uninitialized [] would make all files invisible on the next read.
+    if (empty($versions['files'])) $versions['files'] = new \stdClass();
+    if (empty($versions['reads'])) $versions['reads'] = new \stdClass();
     file_put_contents($tmp, json_encode($versions, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
     rename($tmp, $path);
 }
