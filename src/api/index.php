@@ -89,7 +89,7 @@ if (!$resolved) {
         'name'   => $gslot['name'],
         'role'   => 'Guest worker',
         'class'  => 'worker',
-        'id'     => 'guest_' . $gslot['n'],
+        'id'     => $gslot['id'],   // per-session: a reused slot never inherits old claims
         'secret' => (string) $secret,
         'guest'  => true,
     ];
@@ -132,9 +132,12 @@ switch ($route) {
     case 'GET kanban':          handleGetKanban($projectDir, $agent); break;
     case 'POST kanban-claim':   handleKanbanClaim($projectDir, $agent); break;
     case 'POST kanban-release': handleKanbanRelease($projectDir, $agent); break;
+    case 'POST kanban-assign':  handleKanbanAssign($projectDir, $agent); break;
     case 'POST kanban-state':   handleKanbanState($projectDir, $agent); break;
     case 'POST kanban-comment': handleKanbanComment($projectDir, $agent); break;
     case 'POST kanban-save':    handleKanbanSave($projectDir, $agent); break;
+    case 'GET claim-timeouts':  handleGetClaimTimeouts($projectDir); break;
+    case 'POST claim-timeouts': handleSetClaimTimeouts($projectDir, $agent); break;
     default:
         respond(404, ['error' => 'not_found', 'message' => "No route: $route"]);
 }
@@ -161,6 +164,7 @@ function handleConnect(string $projectDir, array $meta, array $agent, string $pr
             'agent'        => ['name' => $agent['name'], 'role' => $agent['role'], 'class' => $agent['class'] ?? 'manager'],
             'design_doc'   => 'design.md',
             'has_kanban'   => project_has_kanban($projectDir),
+            'claim_timeouts_hours' => claim_timeouts_hours($meta),   // agent/guest renew on any activity
             'file_count'   => $fileCount,
             'chat_unread'  => $chatUnread,
             'chat_total'   => $chatTotal,
@@ -657,9 +661,10 @@ function handleGuestConnect(): void {
         'description'          => $meta['description'] ?? '',
         'design_doc'           => 'design.md',
         'has_kanban'           => true,
+        'claim_timeouts_hours' => claim_timeouts_hours($meta),
         'available_task_count' => $a['available'],
         'instructions'         => 'You are a guest worker. From now on send the token as your X-Agent-Secret and address the assigned project in the path, e.g. GET /' . $a['project']
-                                . '/kanban. Claim a ready task, work it, then mark it done. If you must stop before finishing, set the task to "partly" with a comment so the next worker can continue. You start fresh on every connect.',
+                                . '/kanban. Claim a ready task, work it, then mark it done. If you must stop before finishing, set the task to "partly" with a comment so the next worker can continue. Your claim and this session stay alive as long as you make a request at least every claim_timeouts_hours.guest hours. You start fresh on every connect.',
         'server_time'          => now_iso(),
     ]);
 }
@@ -692,6 +697,7 @@ function respondKanbanConflict(string $projectDir, RuntimeException $e): void {
     $cur = (int) substr($e->getMessage(), strlen('KANBAN_VERSION_CONFLICT:'));
     $latest = kanban_load($projectDir);
     kanban_compute_states($latest);
+    kanban_annotate($latest, $projectDir);
     respond(409, [
         'error'           => 'version_conflict',
         'message'         => "Kanban was modified. Current version is $cur.",
@@ -710,8 +716,10 @@ function handleGetKanban(string $projectDir, array $agent): void {
         return ['_no_change' => true];
     });
     kanban_compute_states($data);
+    kanban_annotate($data, $projectDir);
     respond(200, [
         'kanban_version' => $data['kanban_version'],
+        'claim_timeouts_hours' => claim_timeouts_hours(meta_load($projectDir)),
         'wps'            => $data['wps'],
         'next_wp_id'     => $data['next_wp_id']   ?? null,
         'next_task_id'   => $data['next_task_id'] ?? null,
@@ -751,6 +759,7 @@ function handleKanbanClaim(string $projectDir, array $agent): void {
         if (is_array($result) && isset($result['error'])) {
             respond($result['error'] === 'task_not_found' ? 404 : 409, $result);
         }
+        kanban_annotate($saved, $projectDir);
         respond(200, ['kanban_version' => $saved['kanban_version'],
             'task' => kanban_find_task($saved, $taskId)]);
     } catch (RuntimeException $e) {
@@ -789,6 +798,68 @@ function handleKanbanRelease(string $projectDir, array $agent): void {
                   : ($result['error'] === 'forbidden' ? 403 : 409);
             respond($code, $result);
         }
+        kanban_annotate($saved, $projectDir);
+        respond(200, ['kanban_version' => $saved['kanban_version'],
+            'task' => kanban_find_task($saved, $taskId)]);
+    } catch (RuntimeException $e) {
+        if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) respondKanbanConflict($projectDir, $e);
+        throw $e;
+    }
+}
+
+/**
+ * Managers only: assign a task to a human project member (the owner or a
+ * sharee, by email). The task becomes claimed by that human, exactly as if they
+ * had claimed it in the web UI (human claim timeout, counted from now), and a
+ * comment records who assigned it. Reassigning a claimed task is allowed.
+ * To unassign, use kanban-release.
+ */
+function handleKanbanAssign(string $projectDir, array $agent): void {
+    if (!agentIsManager($agent)) {
+        respond(403, ['error' => 'forbidden', 'message' => 'Only manager agents can assign tasks']);
+    }
+    if (!project_has_kanban($projectDir)) respond(404, ['error' => 'kanban_disabled']);
+    $body = kanbanBody();
+    $taskId   = (string) ($body['task_id'] ?? '');
+    $assignee = strtolower(trim((string) ($body['assignee'] ?? '')));
+    $note     = isset($body['comment']) ? trim((string) $body['comment']) : '';
+    $expected = isset($body['expected_version']) ? (int) $body['expected_version'] : null;
+    if ($taskId === '') respond(400, ['error' => 'bad_request', 'message' => 'task_id required']);
+
+    // Project members = owner (from the data path) + shared_with.
+    $owner   = basename(dirname($projectDir, 2));
+    $members = array_merge([$owner], meta_load($projectDir)['shared_with'] ?? []);
+    $members = array_values(array_unique(array_map('strtolower', $members)));
+    if (!in_array($assignee, $members, true)) {
+        respond(400, ['error' => 'bad_request',
+            'message' => 'assignee must be the email of a human project member',
+            'members' => $members]);
+    }
+
+    $aid = agentId($agent); $aname = $agent['name'] ?? 'agent';
+    try {
+        [$saved, $result] = kanban_with_lock($projectDir, $expected,
+                function(array &$d) use ($taskId, $assignee, $note, $aid, $aname) {
+            $task = &kanban_find_task($d, $taskId);
+            if ($task === null) return ['_no_change' => true, 'error' => 'task_not_found'];
+            $state = $task['state'] ?? 'open';
+            if ($state === 'open') return ['_no_change' => true, 'error' => 'task_not_ready'];
+            if ($state === 'done') return ['_no_change' => true, 'error' => 'task_done'];
+            $prev = ($state === 'claimed') ? ($task['claimed_by_name'] ?? $task['claimed_by'] ?? null) : null;
+            $task['state']           = 'claimed';
+            $task['claimed_by']      = $assignee;
+            $task['claimed_by_name'] = $assignee;
+            $task['claimed_at']      = now_iso();
+            if (!isset($task['comments']) || !is_array($task['comments'])) $task['comments'] = [];
+            $text = "Assigned to $assignee by $aname" . ($prev && $prev !== $assignee ? " (was: $prev)" : '') . '.';
+            if ($note !== '') $text .= ' ' . $note;
+            $task['comments'][] = ['by' => $aid, 'by_name' => $aname, 'at' => now_iso(), 'text' => $text];
+            return null;
+        });
+        if (is_array($result) && isset($result['error'])) {
+            respond($result['error'] === 'task_not_found' ? 404 : 409, $result);
+        }
+        kanban_annotate($saved, $projectDir);
         respond(200, ['kanban_version' => $saved['kanban_version'],
             'task' => kanban_find_task($saved, $taskId)]);
     } catch (RuntimeException $e) {
@@ -859,6 +930,7 @@ function handleKanbanState(string $projectDir, array $agent): void {
                   : ($result['error'] === 'forbidden' ? 403 : 409);
             respond($code, $result);
         }
+        kanban_annotate($saved, $projectDir);
         respond(200, ['kanban_version' => $saved['kanban_version'],
             'task' => kanban_find_task($saved, $taskId)]);
     } catch (RuntimeException $e) {
@@ -889,6 +961,7 @@ function handleKanbanComment(string $projectDir, array $agent): void {
         if (is_array($result) && isset($result['error'])) {
             respond($result['error'] === 'task_not_found' ? 404 : 409, $result);
         }
+        kanban_annotate($saved, $projectDir);
         respond(200, ['kanban_version' => $saved['kanban_version'],
             'task' => kanban_find_task($saved, $taskId)]);
     } catch (RuntimeException $e) {
@@ -916,11 +989,37 @@ function handleKanbanSave(string $projectDir, array $agent): void {
             if (isset($body['next_wp_id']))   $d['next_wp_id']   = (int) $body['next_wp_id'];
             if (isset($body['next_task_id'])) $d['next_task_id'] = (int) $body['next_task_id'];
         });
+        kanban_annotate($saved, $projectDir);
         respond(200, ['kanban_version' => $saved['kanban_version'], 'wps' => $saved['wps']]);
     } catch (RuntimeException $e) {
         if (strpos($e->getMessage(), 'KANBAN_VERSION_CONFLICT:') === 0) respondKanbanConflict($projectDir, $e);
         throw $e;
     }
+}
+
+// --- Claim timeouts ---------------------------------------------------------
+
+function handleGetClaimTimeouts(string $projectDir): void {
+    respond(200, ['claim_timeouts_hours' => claim_timeouts_hours(meta_load($projectDir)),
+        'renewal' => 'agent and guest claims renew on any request by the claimer; human claims count from claimed_at']);
+}
+
+/** Managers may change the project's claim timeouts. Body: {agent_hours?, guest_hours?, human_hours?}. */
+function handleSetClaimTimeouts(string $projectDir, array $agent): void {
+    if (!agentIsManager($agent)) {
+        respond(403, ['error' => 'forbidden', 'message' => 'Only manager agents can change claim timeouts']);
+    }
+    $body = kanbanBody();
+    $result = with_file_lock("$projectDir/.lock", function() use ($projectDir, $body) {
+        $meta = json_decode((string) @file_get_contents("$projectDir/meta.json"), true);
+        if (!is_array($meta)) respond(500, ['error' => 'meta_unreadable']);
+        $new = claim_timeouts_apply($meta, $body);
+        if (is_string($new)) respond(400, ['error' => 'bad_request', 'message' => $new]);
+        $meta['claim_timeouts'] = $new;
+        meta_save($projectDir, $meta);
+        return $meta;
+    });
+    respond(200, ['claim_timeouts_hours' => claim_timeouts_hours($result)]);
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -984,18 +1083,18 @@ function readVersions(string $projectDir): array {
     if (!file_exists($path)) {
         return ['files' => [], 'reads' => [], 'last_seen' => []];
     }
-    $data = json_decode(file_get_contents($path), true);
+    $data = json_decode((string) file_get_contents($path), true);
     if (!is_array($data)) {
-        return ['files' => [], 'reads' => [], 'last_seen' => []];
+        // Never continue with an empty index when the file exists but can't be
+        // parsed: the caller would write it back and wipe the project's index.
+        respond(500, ['error' => 'versions_unreadable', 'message' => 'versions.json unreadable, try again']);
     }
-    // Normalize: 'files' and 'reads' must be associative maps, not sequential arrays.
-    // A serialization bug can produce "files":[] on disk (json_encode([]) = "[]").
-    // Both [] and {} decode identically in PHP (assoc=true), so this check catches
-    // any non-assoc value: if non-empty and first key is an integer, reset to [].
+    // 'files'/'reads' are maps. An empty map may be stored as [] (json_encode([]));
+    // numeric file names decode to int keys, which is fine — never reset non-empty data.
     $files = $data['files'] ?? [];
-    if (!is_array($files) || (!empty($files) && is_int(array_key_first($files)))) $files = [];
+    if (!is_array($files)) $files = [];
     $reads = $data['reads'] ?? [];
-    if (!is_array($reads) || (!empty($reads) && is_int(array_key_first($reads)))) $reads = [];
+    if (!is_array($reads)) $reads = [];
     $data['files']     = $files;
     $data['reads']     = $reads;
     $data['last_seen'] = $data['last_seen'] ?? [];

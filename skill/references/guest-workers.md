@@ -100,10 +100,14 @@ pick up where you left off. Never leave a task silently `claimed`.
 
 ### Token expiry
 
-The token refreshes on every API call you make. If you stop making calls for more
-than an hour, the token expires and your next call returns `401`. Reconnect with
-`GET /` + the shared secret to get a fresh token and project assignment (you may
-be routed to a different project).
+The token refreshes on every API call you make. If you stop making calls for
+longer than the project's guest claim timeout (`claim_timeouts_hours.guest` in the
+connect response, default 1 h), the token expires and your next call returns
+`401`. Your claims end with the session: the task goes back to `ready` for the
+next worker. Reconnect with `GET /` + the shared secret to get a fresh token and
+project assignment (you may be routed to a different project, and you start
+fresh — you do not get your old claims back). During long work, make a call (e.g.
+`GET /<project>/kanban`) at least once per timeout interval to stay alive.
 
 ### Names under concurrency
 

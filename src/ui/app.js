@@ -677,6 +677,11 @@ async function showCreateProject() {
             })
         ),
         el('div', { class: 'muted' }, 'Defines the default name suggestions when adding agents.'),
+        el('label', { class: 'row', style: 'gap: 0.5rem; align-items: center; margin-top: 0.75rem' },
+            el('input', { type: 'checkbox', id: 'p-kanban', checked: 'checked' }),
+            el('span', {}, 'Kanban board'),
+        ),
+        el('div', { class: 'muted' }, 'Starts with one empty "Backlog" work package. Can be switched off later in Settings.'),
         el('div', { class: 'row', style: 'margin-top: 1rem' },
             el('button', { on: { click: async () => {
                 try {
@@ -687,7 +692,8 @@ async function showCreateProject() {
                     const display_name = document.getElementById('p-display').value.trim() || name;
                     const description = document.getElementById('p-desc').value.trim();
                     const naming_scheme = document.getElementById('p-scheme').value;
-                    await adminPost('create-project', { name, display_name, description, naming_scheme });
+                    const has_kanban = document.getElementById('p-kanban').checked;
+                    await adminPost('create-project', { name, display_name, description, naming_scheme, has_kanban });
                     setStatus(`Created project "${display_name}"`);
                     setMode('browse');
                     showProject(name);
@@ -700,6 +706,26 @@ async function showCreateProject() {
 }
 
 // --- Views: Project ------------------------------------------------------
+
+// Red reminder under the project title: every task currently claimed by
+// (or assigned by a manager to) the logged-in user and not yet finished.
+function updateAssignmentNotice(board) {
+    const box = document.getElementById('assignment-notice');
+    if (!box) return;
+    box.innerHTML = '';
+    const me = window.CURRENT_USER && window.CURRENT_USER.email;
+    if (!me || !board || !board.wps) return;
+    for (const wp of board.wps) {
+        const labels = kanbanComputeLabels(wp, board.wps.indexOf(wp) + 1);
+        (wp.tasks || []).forEach((t, i) => {
+            if (t.state !== 'claimed' || t.claimed_by !== me) return;
+            box.appendChild(el('div', { class: 'assignment-notice' },
+                `You have been assigned to task ${t.label || labels[i]}`,
+                t.name ? ` (${t.name})` : '',
+                '. It is still unfinished.'));
+        });
+    }
+}
 
 async function showProject(name, owner = null) {
     setMode('browse');
@@ -728,12 +754,17 @@ async function showProject(name, owner = null) {
         if (data.role_in_project !== 'owner') {
             app.appendChild(el('div', { class: 'project-owner muted' }, 'Project owned by ', el('strong', {}, data.owner)));
         }
+        app.appendChild(el('div', { id: 'assignment-notice' }));
         app.appendChild(el('div', { class: 'muted', style: 'margin-bottom: 1rem' }, data.description));
         const canShare = window.CURRENT_USER.role === 'admin' || data.role_in_project === 'owner';
         app.appendChild(buildTabStrip(data));
         app.appendChild(el('div', { id: 'tab-content' }));
 
         renderTab();
+        if (data.has_kanban) {
+            adminGet('kanban', { p: name, owner: state.projectOwner })
+                .then(updateAssignmentNotice).catch(() => {});
+        }
         pollNews();   // show badges immediately, don't wait for first poll tick
         startPolling();
     } catch (e) {
@@ -1876,7 +1907,8 @@ function kanbanComputeLabels(wp, wpIndex) {
 function kanbanTaskCard(task, label, userColors, isFirst) {
     const card = el('div', {
         class: 'kanban-task k-state-' + (task.state || 'ready'),
-        title: task.description || task.name || '',
+        title: (task.description || task.name || '')
+             + (task.claim_expires_at ? '\n\nClaim expires: ' + fmtTime(task.claim_expires_at) : ''),
         'data-task-id': task.id,
     });
 
@@ -3190,6 +3222,7 @@ async function kanbanRefreshSilently() {
     state.kanbanData    = board;
     state.kanbanVersion = board.kanban_version;
     state.userColors    = colorResp.colors || {};
+    updateAssignmentNotice(board);
 
     const newGrid = kanbanBuildGrid(board);
     oldGrid.parentNode.replaceChild(newGrid, oldGrid);
@@ -3220,6 +3253,7 @@ async function renderKanban() {
         state.kanbanData = board;
         state.kanbanVersion = board.kanban_version;
         state.userColors = colorResp.colors || {};
+        updateAssignmentNotice(board);
 
         pane.innerHTML = '';
 
@@ -3299,6 +3333,7 @@ async function renderSettings() {
     const canToggleKanban = projectData.role_in_project === 'owner'
                          || window.CURRENT_USER.role === 'admin';
     if (canToggleKanban) {
+        let syncGuestTimeoutRow = () => {};   // set once the claim-timeout inputs exist
         pane.appendChild(el('h2', {}, 'Kanban board'));
         const cb = el('input', { type: 'checkbox', id: 's-kanban' });
         if (projectData.has_kanban) cb.checked = true;
@@ -3313,6 +3348,7 @@ async function renderSettings() {
                 });
                 state.projectData.has_kanban = wanted;
                 setStatus(wanted ? 'Kanban enabled' : 'Kanban disabled');
+                syncGuestTimeoutRow();
                 // Guest workers depend on the board: reflect that here.
                 guestCb.disabled = !wanted;
                 if (!wanted && guestCb.checked) {
@@ -3341,7 +3377,7 @@ async function renderSettings() {
         ));
         pane.appendChild(el('div', { class: 'muted', style: 'font-size: 0.85rem; margin-top: 0.25rem' },
             'Adds a Kanban tab between Files and Chat. ' +
-            'On first enable, a "Phase 0" work package is seeded automatically.'));
+            'On first enable, an empty "Backlog" work package is seeded automatically.'));
 
         // --- Guest workers (depends on Kanban) -------------------------
         const guestCb = el('input', { type: 'checkbox', id: 's-guest' });
@@ -3369,6 +3405,7 @@ async function renderSettings() {
                 });
                 state.projectData.guest_workers = wanted;
                 setStatus(wanted ? 'Guest workers allowed' : 'Guest workers disabled');
+                syncGuestTimeoutRow();
             } catch (e) {
                 guestCb.checked = !wanted;
                 setError(e.message);
@@ -3384,6 +3421,42 @@ async function renderSettings() {
             'Guest workers are AI instances that connect to the collab system and offer ' +
             'work support. By enabling guest workers you allow these external AIs to read ' +
             'your project data and complete tasks for it.'));
+
+        // --- Claim timeouts ----------------------------------------------
+        const ct = projectData.claim_timeouts_hours || { agent: 3, guest: 1, human: 168 };
+        const ctInput = (id, val, min, max) => {
+            const i = el('input', { type: 'number', id, min, max, step: '0.25', style: 'width: 6rem' });
+            i.value = val;
+            return i;
+        };
+        const ctAgent = ctInput('s-ct-agent', ct.agent, 0.25, 168);
+        const ctGuest = ctInput('s-ct-guest', ct.guest, 0.25, 168);
+        const ctHuman = ctInput('s-ct-human', ct.human, 1, 2160);
+        const ctRow = (input, label) => el('label', { class: 'row', style: 'gap: 0.5rem; align-items: center; margin-top: 0.4rem' },
+            input, el('span', {}, label));
+        const guestRow = ctRow(ctGuest, 'hours: guest-worker claims');
+        syncGuestTimeoutRow = () => { guestRow.hidden = !state.projectData.guest_workers; };
+        syncGuestTimeoutRow();
+        pane.appendChild(el('h3', {}, 'Claim timeouts'));
+        pane.appendChild(ctRow(ctAgent, 'hours: agent claims'));
+        pane.appendChild(guestRow);
+        pane.appendChild(ctRow(ctHuman, 'hours: human claims'));
+        pane.appendChild(el('div', { class: 'muted', style: 'font-size: 0.85rem; margin-top: 0.25rem' },
+            'An unfinished claim returns to "ready" after this time. Agent and guest claims ' +
+            'restart the clock whenever the claimer talks to the server; human claims count ' +
+            'from the moment of claiming. Manager agents can change these values too.'));
+        pane.appendChild(el('div', { class: 'row', style: 'margin-top: 0.5rem' },
+            el('button', { class: 'secondary', on: { click: async () => {
+                try {
+                    const body = { owner: state.projectOwner, project: state.project,
+                        agent_hours: Number(ctAgent.value), human_hours: Number(ctHuman.value) };
+                    if (state.projectData.guest_workers) body.guest_hours = Number(ctGuest.value);
+                    const r = await adminPost('set-claim-timeouts', body);
+                    state.projectData.claim_timeouts_hours = r.claim_timeouts_hours;
+                    setStatus('Claim timeouts saved');
+                } catch (e) { setError(e.message); }
+            }}}, 'Save timeouts'),
+        ));
     }
 
     const isProjectOwner = projectData.role_in_project === 'owner';

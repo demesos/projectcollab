@@ -15,6 +15,7 @@
  *   POST   ?action=leave-project                       body: {owner, project}
  *   GET    ?action=backup&owner=<email>&p=<name>       (admin or owner)
  *   --- Agents ---
+ *   POST   ?action=set-claim-timeouts                  body: {owner, project, agent_hours?, guest_hours?, human_hours?}
  *   POST   ?action=add-agent                           body: {owner, project, name, role}
  *   POST   ?action=remove-agent                        body: {owner, project, secret}
  *   --- Users ---
@@ -73,6 +74,7 @@ try {
         case 'GET user-colors':          userColorsList($user); break;
         case 'POST toggle-kanban':       toggleKanban($user, json_body()); break;
         case 'POST toggle-guest-workers': toggleGuestWorkers($user, json_body()); break;
+        case 'POST set-claim-timeouts':  setClaimTimeouts($user, json_body()); break;
 
         // --- Kanban CRUD ---
         case 'GET kanban':               getKanban($user); break;
@@ -182,6 +184,7 @@ function getProject(array $user): void {
         'role_in_project'  => $owner === $user['email'] ? 'owner' : 'member',
         'has_kanban'       => !empty($meta['has_kanban']),
         'guest_workers'    => !empty($meta['guest_workers']),
+        'claim_timeouts_hours' => claim_timeouts_hours($meta),
         'display_name'     => $meta['name'] ?? $project,
         'description'      => $meta['description'] ?? '',
         'created'          => $meta['created'] ?? null,
@@ -234,6 +237,7 @@ function createProject(array $user, array $body): void {
         'description'    => $body['description'] ?? 'New project.',
         'created'        => now_iso(),
         'naming_scheme'  => $namingScheme,
+        'has_kanban'     => !array_key_exists('has_kanban', $body) || !empty($body['has_kanban']),   // default on
         'shared_with'    => [],
         'agents'         => [
             $ownerSecret => ['name' => $ownerLocal, 'role' => 'owner', 'admin' => true, 'class' => 'manager', 'id' => gen_agent_id()],
@@ -243,6 +247,7 @@ function createProject(array $user, array $body): void {
     writeWithPerms("$dir/versions.json", json_encode(['files' => new stdClass(), 'reads' => new stdClass(), 'last_seen' => new stdClass()], JSON_PRETTY_PRINT), 0660);
     writeWithPerms("$dir/chat.log", '', 0660);
     writeWithPerms("$dir/.lock", '', 0660);
+    if ($meta['has_kanban']) kanban_save($dir, kanban_default());   // starts with one empty "Backlog" WP
 
     respond_json(200, ['name' => $name, 'owner' => $owner]);
 }
@@ -268,10 +273,8 @@ function updateDescription(array $user, array $body): void {
     $owner = (string) ($body['owner'] ?? $user['email']);
     requireProjectAccess($user, $owner, $project);
     $dir = project_dir($owner, $project);
-    $metaPath = "$dir/meta.json";
-    $meta = jsonRead($metaPath);
-    $meta['description'] = (string) ($body['description'] ?? '');
-    writeWithPerms($metaPath, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+    $description = (string) ($body['description'] ?? '');
+    metaUpdate($dir, function(array &$meta) use ($description) { $meta['description'] = $description; });
     respond_json(200, ['ok' => true]);
 }
 
@@ -285,13 +288,13 @@ function shareProject(array $user, array $body): void {
     if ($username === $owner) respond_json(400, ['error' => 'Cannot share with owner']);
 
     $dir = project_dir($owner, $project);
-    $meta = jsonRead("$dir/meta.json");
-    $shared = $meta['shared_with'] ?? [];
-    if (!in_array($username, $shared, true)) {
-        $shared[] = $username;
-    }
-    $meta['shared_with'] = array_values(array_unique($shared));
-    writeWithPerms("$dir/meta.json", json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+    $meta = metaUpdate($dir, function(array &$meta) use ($username) {
+        $shared = $meta['shared_with'] ?? [];
+        if (!in_array($username, $shared, true)) {
+            $shared[] = $username;
+        }
+        $meta['shared_with'] = array_values(array_unique($shared));
+    });
     respond_json(200, ['shared_with' => $meta['shared_with']]);
 }
 
@@ -302,10 +305,10 @@ function unshareProject(array $user, array $body): void {
     requireProjectOwner($user, $owner, $project);
 
     $dir = project_dir($owner, $project);
-    $meta = jsonRead("$dir/meta.json");
-    $shared = $meta['shared_with'] ?? [];
-    $meta['shared_with'] = array_values(array_filter($shared, fn($u) => $u !== $username));
-    writeWithPerms("$dir/meta.json", json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+    $meta = metaUpdate($dir, function(array &$meta) use ($username) {
+        $shared = $meta['shared_with'] ?? [];
+        $meta['shared_with'] = array_values(array_filter($shared, fn($u) => $u !== $username));
+    });
     respond_json(200, ['shared_with' => $meta['shared_with']]);
 }
 
@@ -317,14 +320,14 @@ function leaveProject(array $user, array $body): void {
     }
     $dir = project_dir($owner, $project);
     if (!is_dir($dir)) respond_json(404, ['error' => 'Project not found']);
-    $metaPath = "$dir/meta.json";
-    $meta = jsonRead($metaPath);
-    $shared = $meta['shared_with'] ?? [];
-    if (!in_array($user['email'], $shared, true)) {
-        respond_json(400, ['error' => 'You are not a member of this project']);
-    }
-    $meta['shared_with'] = array_values(array_filter($shared, fn($u) => $u !== $user['email']));
-    writeWithPerms($metaPath, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+    $email = $user['email'];
+    metaUpdate($dir, function(array &$meta) use ($email) {
+        $shared = $meta['shared_with'] ?? [];
+        if (!in_array($email, $shared, true)) {
+            respond_json(400, ['error' => 'You are not a member of this project']);
+        }
+        $meta['shared_with'] = array_values(array_filter($shared, fn($u) => $u !== $email));
+    });
     respond_json(200, ['left' => $project]);
 }
 
@@ -355,8 +358,6 @@ function addAgent(array $user, array $body): void {
     requireProjectAccess($user, $owner, $project);
 
     $dir = project_dir($owner, $project);
-    $metaPath = "$dir/meta.json";
-    $meta = jsonRead($metaPath);
 
     $name = trim((string) ($body['name'] ?? ''));
     $role = trim((string) ($body['role'] ?? ''));
@@ -371,10 +372,9 @@ function addAgent(array $user, array $body): void {
 
     $secret = bin2hex(random_bytes(16));
     $id     = gen_agent_id();
-    $meta['agents'][$secret] = ['name' => $name, 'role' => $role, 'class' => $class, 'id' => $id,
-                                'created_by' => $user['email']];
-
-    writeWithPerms($metaPath, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+    $agent  = ['name' => $name, 'role' => $role, 'class' => $class, 'id' => $id,
+               'created_by' => $user['email']];
+    metaUpdate($dir, function(array &$meta) use ($secret, $agent) { $meta['agents'][$secret] = $agent; });
     respond_json(200, ['secret' => $secret, 'name' => $name, 'role' => $role, 'class' => $class, 'id' => $id]);
 }
 
@@ -385,21 +385,20 @@ function removeAgent(array $user, array $body): void {
 
     $secret = (string) ($body['secret'] ?? '');
     $dir = project_dir($owner, $project);
-    $metaPath = "$dir/meta.json";
-    $meta = jsonRead($metaPath);
 
-    if (!isset($meta['agents'][$secret])) {
-        respond_json(404, ['error' => 'Agent not found']);
-    }
-    if (!empty($meta['agents'][$secret]['admin'])) {
-        respond_json(400, ['error' => 'Cannot remove the owner agent']);
-    }
-    if (agentOwner($meta['agents'][$secret], $owner) !== $user['email']
-        && $owner !== $user['email'] && !has_role_at_least($user, 'admin')) {
-        respond_json(403, ['error' => 'forbidden', 'message' => 'Only the creator of this agent or the project owner can remove it']);
-    }
-    unset($meta['agents'][$secret]);
-    writeWithPerms($metaPath, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+    metaUpdate($dir, function(array &$meta) use ($secret, $owner, $user) {
+        if (!isset($meta['agents'][$secret])) {
+            respond_json(404, ['error' => 'Agent not found']);
+        }
+        if (!empty($meta['agents'][$secret]['admin'])) {
+            respond_json(400, ['error' => 'Cannot remove the owner agent']);
+        }
+        if (agentOwner($meta['agents'][$secret], $owner) !== $user['email']
+            && $owner !== $user['email'] && !has_role_at_least($user, 'admin')) {
+            respond_json(403, ['error' => 'forbidden', 'message' => 'Only the creator of this agent or the project owner can remove it']);
+        }
+        unset($meta['agents'][$secret]);
+    });
     respond_json(200, ['removed' => $secret]);
 }
 
@@ -551,10 +550,10 @@ function removeUser(array $user, array $body): void {
                 if (!is_file($metaPath)) continue;
                 $meta = json_decode((string) file_get_contents($metaPath), true);
                 if (!is_array($meta)) continue;
-                $sw = $meta['shared_with'] ?? [];
-                if (in_array($target, $sw, true)) {
-                    $meta['shared_with'] = array_values(array_filter($sw, fn($u) => $u !== $target));
-                    writeWithPerms($metaPath, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+                if (in_array($target, $meta['shared_with'] ?? [], true)) {
+                    metaUpdate("$projRoot/$proj", function(array &$meta) use ($target) {
+                        $meta['shared_with'] = array_values(array_filter($meta['shared_with'] ?? [], fn($u) => $u !== $target));
+                    });
                 }
             }
         }
@@ -910,6 +909,19 @@ function toggleKanban(array $user, array $body): void {
  * Owner-or-admin gated. Sets guest_workers in meta.json. Enabling requires the
  * Kanban board to be enabled first (guests only ever work board tasks).
  */
+function setClaimTimeouts(array $user, array $body): void {
+    $project = (string) ($body['project'] ?? '');
+    $owner   = (string) ($body['owner'] ?? $user['email']);
+    requireProjectOwner($user, $owner, $project);
+    $dir = project_dir($owner, $project);
+    $meta = metaUpdate($dir, function(array &$meta) use ($body) {
+        $new = claim_timeouts_apply($meta, $body);
+        if (is_string($new)) respond_json(400, ['error' => 'bad_request', 'message' => $new]);
+        $meta['claim_timeouts'] = $new;
+    });
+    respond_json(200, ['claim_timeouts_hours' => claim_timeouts_hours($meta)]);
+}
+
 function toggleGuestWorkers(array $user, array $body): void {
     $project = (string) ($body['project'] ?? '');
     $owner   = (string) ($body['owner'] ?? $user['email']);
@@ -989,6 +1001,7 @@ function getKanban(array $user): void {
         return ['_no_change' => true];
     });
     kanban_compute_states($data);
+    kanban_annotate($data, $dir);
 
     // Attach actor_color per task
     $colorMap = ['agent' => KANBAN_AZZURRO];
@@ -1326,6 +1339,7 @@ function respond_versionConflict(string $dir, RuntimeException $e): void {
     $cur = (int) substr($e->getMessage(), strlen('KANBAN_VERSION_CONFLICT:'));
     $latest = kanban_load($dir);
     kanban_compute_states($latest);
+    kanban_annotate($latest, $dir);
     respond_json(409, [
         'error' => 'version_conflict',
         'message' => "Kanban was modified. Current version is $cur.",
@@ -1350,6 +1364,19 @@ function resolveProjectContext(array $user): array {
     return [$ownerSecret, $owner, $project, $dir, $meta];
 }
 
+// Locked read-modify-write of a project's meta.json. $fn receives the meta
+// array by reference. Refuses to write if the current file can't be parsed,
+// so a damaged meta.json is never replaced by a near-empty one.
+function metaUpdate(string $dir, callable $fn): array {
+    return uiWithLock($dir, function() use ($dir, $fn) {
+        $meta = jsonRead("$dir/meta.json");
+        if ($meta === null) respond_json(500, ['error' => 'meta_unreadable', 'message' => 'meta.json missing or unreadable']);
+        $fn($meta);
+        writeWithPerms("$dir/meta.json", json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), 0660);
+        return $meta;
+    });
+}
+
 function uiWithLock(string $dir, callable $fn) {
     $fh = fopen("$dir/.lock", 'c');
     if (!$fh || !flock($fh, LOCK_EX)) respond_json(500, ['error' => 'Lock failed']);
@@ -1358,14 +1385,20 @@ function uiWithLock(string $dir, callable $fn) {
 }
 
 function readVersions(string $dir): array {
-    $v = jsonRead("$dir/versions.json") ?? [];
-    // Normalize: 'files' and 'reads' must be associative maps, not sequential arrays.
-    // A serialization bug can produce "files":[] on disk (json_encode([]) = "[]").
-    // If non-empty and first key is an integer, reset to empty (wrong data type).
+    $path = "$dir/versions.json";
+    $v = jsonRead($path);
+    if ($v === null) {
+        // Never continue with an empty index when the file exists but can't be
+        // parsed: the caller would write it back and wipe the project's index.
+        if (is_file($path)) respond_json(500, ['error' => 'versions_unreadable', 'message' => 'versions.json unreadable, try again']);
+        $v = [];
+    }
+    // 'files'/'reads' are maps. An empty map may be stored as [] (json_encode([]));
+    // numeric file names decode to int keys, which is fine — never reset non-empty data.
     $files = $v['files'] ?? [];
-    if (!is_array($files) || (!empty($files) && is_int(array_key_first($files)))) $files = [];
+    if (!is_array($files)) $files = [];
     $reads = $v['reads'] ?? [];
-    if (!is_array($reads) || (!empty($reads) && is_int(array_key_first($reads)))) $reads = [];
+    if (!is_array($reads)) $reads = [];
     $v['files']     = $files;
     $v['reads']     = $reads;
     $v['last_seen'] = $v['last_seen'] ?? [];
@@ -1410,10 +1443,13 @@ function validateFilePath(string $path): string {
 }
 
 function touchLastSeen(string $dir, string $secret): void {
-    // Best-effort, no lock — just a timestamp update, losing one occasionally is fine.
-    $v = readVersions($dir);
-    $v['last_seen'][$secret] = now_iso();
-    writeVersions($dir, $v);
+    // Read-modify-write of versions.json: must hold the project lock, otherwise
+    // it can overwrite concurrent agent/UI changes with a stale copy.
+    uiWithLock($dir, function() use ($dir, $secret) {
+        $v = readVersions($dir);
+        $v['last_seen'][$secret] = now_iso();
+        writeVersions($dir, $v);
+    });
 }
 
 // GET ?action=files
@@ -1608,9 +1644,9 @@ function proxyClearChat(array $user, array $body): void {
             $lines = file($chatPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
             $validLines = array_values(array_filter($lines, fn($l) => is_array(json_decode($l, true))));
             $kept = array_slice($validLines, -$keepCount);
-            file_put_contents($chatPath, $kept ? (implode("\n", $kept) . "\n") : '');
+            writeWithPerms($chatPath, $kept ? (implode("\n", $kept) . "\n") : '', 0660);
         } else {
-            file_put_contents($chatPath, '');
+            writeWithPerms($chatPath, '', 0660);
         }
     });
     respond_json(200, ['ok' => true]);
@@ -1626,9 +1662,11 @@ function proxyGetNews(array $user): void {
     $displayName = strstr($user['email'], '@', true) ?: $user['email'];
     foreach ($meta['agents'] ?? [] as $s => $info) {
         if (strcasecmp($info['name'] ?? '', $displayName) === 0 && $s !== $secret) {
-            $v2 = readVersions($dir);
-            $v2['last_seen'][$s] = now_iso();
-            writeVersions($dir, $v2);
+            uiWithLock($dir, function() use ($dir, $s) {
+                $v2 = readVersions($dir);
+                $v2['last_seen'][$s] = now_iso();
+                writeVersions($dir, $v2);
+            });
             break;
         }
     }
@@ -1701,9 +1739,19 @@ function jsonRead(string $path): ?array {
 }
 
 function writeWithPerms(string $path, string $content, int $mode): void {
-    file_put_contents($path, $content);
-    @chgrp($path, 'www-data');
-    @chmod($path, $mode);
+    // Write to a temp file and rename() into place so concurrent readers never
+    // see a truncated/half-written file. A truncated versions.json used to
+    // decode as empty and get written back, wiping the whole file index.
+    $tmp = $path . '.tmp.' . getmypid();
+    if (file_put_contents($tmp, $content) === false) {
+        throw new RuntimeException("Could not write $path");
+    }
+    @chgrp($tmp, 'www-data');
+    @chmod($tmp, $mode);
+    if (!rename($tmp, $path)) {
+        @unlink($tmp);
+        throw new RuntimeException("Could not replace $path");
+    }
 }
 
 function rrmdir(string $dir): void {

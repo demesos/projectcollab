@@ -35,7 +35,7 @@ function users_load(): array {
 }
 
 function users_save(array $data): void {
-    $tmp = COLLAB_USERS_PATH . '.tmp';
+    $tmp = COLLAB_USERS_PATH . '.tmp.' . getmypid();   // per-process: concurrent saves never share a temp file
     file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
     @chmod($tmp, 0660);
     @chgrp($tmp, 'www-data');
@@ -47,18 +47,39 @@ function user_get(string $email): ?array {
     return $d['users'][$email] ?? null;
 }
 
+/** Run $fn while holding an exclusive flock on $lockPath (created if missing). */
+function with_file_lock(string $lockPath, callable $fn) {
+    if (!is_file($lockPath)) { @touch($lockPath); @chmod($lockPath, 0660); @chgrp($lockPath, 'www-data'); }
+    $fh = fopen($lockPath, 'c');
+    if (!$fh || !flock($fh, LOCK_EX)) throw new RuntimeException("Cannot lock $lockPath");
+    try { return $fn(); }
+    finally { flock($fh, LOCK_UN); fclose($fh); }
+}
+
+/** Load users.json for a read-modify-write; refuses a file that exists but can't be parsed. */
+function users_load_for_update(): array {
+    if (!is_file(COLLAB_USERS_PATH)) return ['users' => []];
+    $d = json_decode((string) file_get_contents(COLLAB_USERS_PATH), true);
+    if (!is_array($d)) throw new RuntimeException('users.json unreadable — refusing to overwrite');
+    return $d;
+}
+
 function user_put(string $email, array $info): void {
-    $d = users_load();
-    $d['users'][$email] = $info;
-    users_save($d);
+    with_file_lock(COLLAB_DATA_ROOT . '/users.lock', function() use ($email, $info) {
+        $d = users_load_for_update();
+        $d['users'][$email] = $info;
+        users_save($d);
+    });
 }
 
 function user_delete_row(string $email): bool {
-    $d = users_load();
-    if (!isset($d['users'][$email])) return false;
-    unset($d['users'][$email]);
-    users_save($d);
-    return true;
+    return with_file_lock(COLLAB_DATA_ROOT . '/users.lock', function() use ($email) {
+        $d = users_load_for_update();
+        if (!isset($d['users'][$email])) return false;
+        unset($d['users'][$email]);
+        users_save($d);
+        return true;
+    });
 }
 
 function user_password_hash(string $pw): string {
@@ -371,8 +392,60 @@ const KANBAN_AZZURRO            = '#85B7EB';
 const KANBAN_HUE_MIN_SEPARATION = 25.0;  // degrees
 const KANBAN_HUE_RELAXED        = 15.0;  // degrees (fallback after 50 tries)
 const KANBAN_COLOR_HISTORY_MAX  = 5;
-const KANBAN_CLAIM_TTL_AGENT    = 3600;        // 1 hour
-const KANBAN_CLAIM_TTL_HUMAN    = 7 * 86400;   // 7 days
+// Claim timeouts (seconds). Per-project overrides live in meta.json
+// 'claim_timeouts' => {agent, guest, human}; see claim_timeouts().
+// Agent and guest claims renew on any activity of the claimer; human claims
+// count from claimed_at (re-claim to refresh).
+const KANBAN_CLAIM_TTL_AGENT    = 3 * 3600;    // 3 hours (default)
+const KANBAN_CLAIM_TTL_GUEST    = 3600;        // 1 hour  (default)
+const KANBAN_CLAIM_TTL_HUMAN    = 7 * 86400;   // 7 days  (default)
+// Allowed range per kind, in seconds: [min, max].
+const KANBAN_CLAIM_TTL_BOUNDS   = [
+    'agent' => [900, 7 * 86400],
+    'guest' => [900, 7 * 86400],
+    'human' => [3600, 90 * 86400],
+];
+
+/** Effective claim timeouts (seconds) for a project's meta. */
+function claim_timeouts(array $meta): array {
+    $def = ['agent' => KANBAN_CLAIM_TTL_AGENT, 'guest' => KANBAN_CLAIM_TTL_GUEST, 'human' => KANBAN_CLAIM_TTL_HUMAN];
+    $cfg = is_array($meta['claim_timeouts'] ?? null) ? $meta['claim_timeouts'] : [];
+    $out = [];
+    foreach ($def as $k => $v) {
+        $x = isset($cfg[$k]) ? (int) $cfg[$k] : $v;
+        [$lo, $hi] = KANBAN_CLAIM_TTL_BOUNDS[$k];
+        $out[$k] = max($lo, min($hi, $x));
+    }
+    return $out;
+}
+
+/** Same as claim_timeouts() but in hours, for API responses. */
+function claim_timeouts_hours(array $meta): array {
+    return array_map(fn($s) => round($s / 3600, 2), claim_timeouts($meta));
+}
+
+/**
+ * Validate a {agent_hours?, guest_hours?, human_hours?} update against the
+ * bounds. Returns the new meta['claim_timeouts'] array (seconds) or an error string.
+ */
+function claim_timeouts_apply(array $meta, array $body) {
+    $cur = claim_timeouts($meta);
+    $any = false;
+    foreach (['agent', 'guest', 'human'] as $k) {
+        if (!array_key_exists("{$k}_hours", $body)) continue;
+        $h = $body["{$k}_hours"];
+        if (!is_numeric($h)) return "{$k}_hours must be a number";
+        $sec = (int) round(((float) $h) * 3600);
+        [$lo, $hi] = KANBAN_CLAIM_TTL_BOUNDS[$k];
+        if ($sec < $lo || $sec > $hi) {
+            return sprintf('%s_hours must be between %s and %s', $k, round($lo / 3600, 2), round($hi / 3600, 2));
+        }
+        $cur[$k] = $sec;
+        $any = true;
+    }
+    if (!$any) return 'give at least one of agent_hours, guest_hours, human_hours';
+    return $cur;
+}
 
 // --- Color math -----------------------------------------------------------
 
@@ -477,7 +550,7 @@ function kanban_path(string $dir): string {
 function kanban_default(): array {
     return [
         'wps' => [
-            ['id' => 'wp_001', 'name' => 'Phase 0', 'tasks' => []],
+            ['id' => 'wp_001', 'name' => 'Backlog', 'tasks' => []],
         ],
         'next_wp_id'     => 2,
         'next_task_id'   => 1,
@@ -498,6 +571,14 @@ function kanban_load(string $dir): array {
 }
 
 function kanban_save(string $dir, array $data): void {
+    // Computed, response-only fields (kanban_annotate) are never stored, even
+    // if a client sends a board it read back.
+    foreach (($data['wps'] ?? []) as $wi => $wp) {
+        unset($data['wps'][$wi]['label']);
+        foreach (($wp['tasks'] ?? []) as $ti => $t) {
+            unset($data['wps'][$wi]['tasks'][$ti]['label'], $data['wps'][$wi]['tasks'][$ti]['claim_expires_at']);
+        }
+    }
     $path = kanban_path($dir);
     $tmp  = $path . '.tmp.' . getmypid();
     file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
@@ -506,20 +587,75 @@ function kanban_save(string $dir, array $data): void {
     rename($tmp, $path);
 }
 
+/** Who holds a claim: 'guest' (guest_*), 'human' (an email) or 'agent'. */
+function kanban_claimer_kind(string $claimedBy): string {
+    if (strpos($claimedBy, 'guest_') === 0) return 'guest';
+    if (strpos($claimedBy, '@') !== false) return 'human';
+    return 'agent';
+}
+
+/**
+ * Context for claim expiry of one project: timeouts plus the last activity of
+ * every registered agent (versions.json last_seen, keyed by agent id) and of
+ * every live guest session (guest-workers.json slot last_seen, keyed by the
+ * session's guest id). Without $dir: defaults, no activity renewal.
+ */
+function kanban_claim_context(string $dir): array {
+    $ctx = ['ttl' => claim_timeouts([]), 'activity' => [], 'guests' => []];
+    if ($dir === '') return $ctx;
+    $meta = json_decode((string) @file_get_contents("$dir/meta.json"), true);
+    if (!is_array($meta)) return $ctx;
+    $ctx['ttl'] = claim_timeouts($meta);
+    $v = json_decode((string) @file_get_contents("$dir/versions.json"), true);
+    $seen = is_array($v['last_seen'] ?? null) ? $v['last_seen'] : [];
+    foreach (($meta['agents'] ?? []) as $secret => $a) {
+        $id = !empty($a['id']) ? (string) $a['id'] : 'ag_' . substr(hash('sha256', (string) $secret), 0, 8);
+        if (isset($seen[$secret])) $ctx['activity'][$id] = strtotime($seen[$secret]) ?: 0;
+    }
+    $g = json_decode((string) @file_get_contents(guest_file()), true);
+    $base = rtrim($dir, '/');
+    foreach ((is_array($g['slots'] ?? null) ? $g['slots'] : []) as $n => $slot) {
+        if (project_dir((string) ($slot['owner'] ?? ''), (string) ($slot['project'] ?? 'x')) !== $base) continue;
+        $gid = guest_agent_id((int) $n, (string) ($slot['token'] ?? ''));
+        $ctx['guests'][$gid] = strtotime($slot['last_seen'] ?? '') ?: 0;
+    }
+    return $ctx;
+}
+
+/**
+ * Unix time at which a claimed task's claim expires, or null if not claimed.
+ * Agent/guest claims run from the later of claimed_at and the claimer's last
+ * activity; a guest claim whose session is gone has already expired.
+ */
+function kanban_claim_deadline(array $task, array $ctx): ?int {
+    if (($task['state'] ?? '') !== 'claimed') return null;
+    $claimedAt = strtotime($task['claimed_at'] ?? '');
+    if (!$claimedAt) return null;
+    $by   = (string) ($task['claimed_by'] ?? '');
+    $kind = kanban_claimer_kind($by);
+    $start = $claimedAt;
+    if ($kind === 'agent') {
+        $start = max($start, $ctx['activity'][$by] ?? 0);
+    } elseif ($kind === 'guest') {
+        if (!isset($ctx['guests'][$by])) return $claimedAt;   // session ended -> expired now
+        $start = max($start, $ctx['guests'][$by]);
+    }
+    return $start + $ctx['ttl'][$kind];
+}
+
 /**
  * Sweep expired claims. Returns true if any claim was reverted.
+ * Pass the project dir so per-project timeouts and activity renewal apply.
  */
-function kanban_resolve_expirations(array &$data): bool {
+function kanban_resolve_expirations(array &$data, string $dir = ''): bool {
     $now = time();
     $changed = false;
+    $ctx = kanban_claim_context($dir);
     foreach ($data['wps'] as &$wp) {
         foreach ($wp['tasks'] as &$task) {
-            if (($task['state'] ?? '') !== 'claimed') continue;
-            $claimedAt = strtotime($task['claimed_at'] ?? '');
-            if (!$claimedAt) continue;
-            $ttl = (($task['capability'] ?? 'agent') === 'human')
-                ? KANBAN_CLAIM_TTL_HUMAN : KANBAN_CLAIM_TTL_AGENT;
-            if ($now - $claimedAt > $ttl) {
+            $deadline = kanban_claim_deadline($task, $ctx);
+            if ($deadline === null) continue;
+            if ($now >= $deadline) {
                 $task['state']      = 'ready';
                 $task['claimed_by'] = null;
                 $task['claimed_by_name'] = null;
@@ -582,7 +718,7 @@ function kanban_with_lock(string $dir, ?int $expected_version, callable $fn) {
     if (!flock($fh, LOCK_EX)) { fclose($fh); throw new RuntimeException('Cannot acquire lock'); }
     try {
         $data = kanban_load($dir);
-        $sweepChanged = kanban_resolve_expirations($data);
+        $sweepChanged = kanban_resolve_expirations($data, $dir);
         if ($expected_version !== null && (int)$data['kanban_version'] !== $expected_version) {
             throw new RuntimeException('KANBAN_VERSION_CONFLICT:' . (int)$data['kanban_version']);
         }
@@ -610,17 +746,15 @@ function project_has_kanban(string $dir): bool {
 }
 
 function project_set_kanban(string $dir, bool $enabled): void {
-    $meta = json_decode((string) @file_get_contents($dir . '/meta.json'), true);
-    if (!is_array($meta)) $meta = [];
-    $meta['has_kanban'] = $enabled;
-    $tmp = $dir . '/meta.json.tmp.' . getmypid();
-    file_put_contents($tmp, json_encode($meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-    @chmod($tmp, 0660);
-    @chgrp($tmp, 'www-data');
-    rename($tmp, $dir . '/meta.json');
-    if ($enabled && !is_file(kanban_path($dir))) {
-        kanban_save($dir, kanban_default());
-    }
+    with_file_lock($dir . '/.lock', function() use ($dir, $enabled) {
+        $meta = json_decode((string) @file_get_contents($dir . '/meta.json'), true);
+        if (!is_array($meta)) throw new RuntimeException('meta.json unreadable — refusing to overwrite');
+        $meta['has_kanban'] = $enabled;
+        meta_save($dir, $meta);
+        if ($enabled && !is_file(kanban_path($dir))) {
+            kanban_save($dir, kanban_default());
+        }
+    });
 }
 
 // ==========================================================================
@@ -665,9 +799,12 @@ function project_has_guest_workers(string $dir): bool {
 }
 
 function project_set_guest_workers(string $dir, bool $enabled): void {
-    $meta = meta_load($dir);
-    $meta['guest_workers'] = $enabled;
-    meta_save($dir, $meta);
+    with_file_lock($dir . '/.lock', function() use ($dir, $enabled) {
+        $meta = json_decode((string) @file_get_contents($dir . '/meta.json'), true);
+        if (!is_array($meta)) throw new RuntimeException('meta.json unreadable — refusing to overwrite');
+        $meta['guest_workers'] = $enabled;
+        meta_save($dir, $meta);
+    });
 }
 
 // ==========================================================================
@@ -688,7 +825,72 @@ function &kanban_find_task(array &$data, string $taskId) {
             }
         }
     }
+    // Not an id: accept the display label as shown in the UI ("T1.2", "1.2b").
+    $want = kanban_normalize_label($taskId);
+    if ($want !== null) {
+        foreach (($data['wps'] ?? []) as $wi => $wp) {
+            $labels = kanban_task_labels($wp, $wi + 1);
+            foreach ($labels as $ti => $lbl) {
+                if (strcasecmp($lbl, $want) === 0) return $data['wps'][$wi]['tasks'][$ti];
+            }
+        }
+    }
     return $null;
+}
+
+/** "t1.2", "1.2b", " T1.2 " -> "T1.2"/"T1.2b"; null if it isn't label-shaped. */
+function kanban_normalize_label(string $ref): ?string {
+    if (!preg_match('/^\s*[Tt]?(\d+)\.(\d+)([a-zA-Z]?)\s*$/', $ref, $m)) return null;
+    return 'T' . (int) $m[1] . '.' . (int) $m[2] . strtolower($m[3]);
+}
+
+/**
+ * Display labels for one WP's tasks, exactly as the UI shows them
+ * (app.js kanbanComputeLabels): T<wp>.<group>, parallel groups get a/b/c...
+ * Returns an array indexed like $wp['tasks'].
+ */
+function kanban_task_labels(array $wp, int $wpIndex): array {
+    $tasks = array_values($wp['tasks'] ?? []);
+    $labels = [];
+    $groupStart = 0; $groupIndex = 0; $n = count($tasks);
+    for ($i = 0; $i <= $n; $i++) {
+        $startsNewGroup = $i === $n || $i === 0 || empty($tasks[$i]['parallel_with_prev']);
+        if ($startsNewGroup && $i > 0) {
+            $size = $i - $groupStart;
+            if ($size === 1) {
+                $labels[$groupStart] = "T{$wpIndex}.{$groupIndex}";
+            } else {
+                for ($j = 0; $j < $size; $j++) {
+                    $labels[$groupStart + $j] = "T{$wpIndex}.{$groupIndex}" . chr(97 + $j);
+                }
+            }
+            $groupStart = $i;
+        }
+        if ($i < $n && empty($tasks[$i]['parallel_with_prev'])) $groupIndex++;
+    }
+    return $labels;
+}
+
+/**
+ * Add response-only fields (never stored; kanban_save strips them):
+ *   wp.label "WP<n>", task.label "T<n>.<m>[a]" (same as the UI),
+ *   task.claim_expires_at (ISO) for claimed tasks.
+ */
+function kanban_annotate(array &$data, string $dir = ''): void {
+    $ctx = kanban_claim_context($dir);
+    foreach (($data['wps'] ?? []) as $wi => $wp) {
+        $data['wps'][$wi]['label'] = 'WP' . ($wi + 1);
+        $labels = kanban_task_labels($wp, $wi + 1);
+        foreach (($wp['tasks'] ?? []) as $ti => $t) {
+            $data['wps'][$wi]['tasks'][$ti]['label'] = $labels[$ti] ?? null;
+            $deadline = kanban_claim_deadline($t, $ctx);
+            if ($deadline !== null) {
+                $data['wps'][$wi]['tasks'][$ti]['claim_expires_at'] = gmdate('Y-m-d\TH:i:s\Z', $deadline);
+            } else {
+                unset($data['wps'][$wi]['tasks'][$ti]['claim_expires_at']);
+            }
+        }
+    }
 }
 
 /**
@@ -746,9 +948,25 @@ function kanban_validate_wps(array $wps): ?string {
 // next opted-in project that has claimable agent work, assigned the lowest free
 // name-slot (1 -> "Xavier", 2 -> "Xavier2", ...), and given an ephemeral session
 // token used as X-Agent-Secret for the rest of the session. Slots recycle once
-// idle past GUEST_IDLE_TTL. See docs/kanban-agents-plan.md §7.
+// idle past their project's guest claim timeout. See docs/kanban-agents-plan.md §7.
 
-const GUEST_IDLE_TTL = 3600;   // 1 h, aligned with the agent claim TTL
+// A guest slot lives as long as its project's guest claim timeout
+// (claim_timeouts()['guest'], default 1 h) of inactivity, so a guest session
+// and its claims always end together.
+
+/** Kanban/claim identity of a guest session: slot number + token fingerprint.
+ *  A later guest reusing the same slot gets a different id, so it can never
+ *  inherit an earlier guest's claims. */
+function guest_agent_id(int $n, string $token): string {
+    return 'guest_' . $n . '_' . substr(hash('sha256', $token), 0, 8);
+}
+
+/** Idle lifetime (seconds) of a guest slot assigned to owner/project. */
+function guest_slot_ttl(array $slot): int {
+    $owner = (string) ($slot['owner'] ?? ''); $project = (string) ($slot['project'] ?? '');
+    if (!valid_email($owner) || !valid_project_slug($project)) return KANBAN_CLAIM_TTL_GUEST;
+    return claim_timeouts(meta_load(project_dir($owner, $project)))['guest'];
+}
 
 function guest_file(): string { return COLLAB_DATA_ROOT . '/guest-workers.json'; }
 
@@ -842,7 +1060,7 @@ function guest_slot_name(int $n): string { return $n === 1 ? 'Xavier' : 'Xavier'
 function guest_available_task_count(string $dir): int {
     if (!project_has_kanban($dir)) return 0;
     $data = kanban_load($dir);
-    kanban_resolve_expirations($data);
+    kanban_resolve_expirations($data, $dir);
     kanban_compute_states($data);
     $n = 0;
     foreach (($data['wps'] ?? []) as $wp) {
@@ -888,13 +1106,14 @@ function guest_resolve_token(string $token): ?array {
         foreach (array_keys($d['slots']) as $n) {
             $slot = $d['slots'][$n];
             $ls = strtotime($slot['last_seen'] ?? '1970-01-01T00:00:00Z');
-            if ($now - $ls > GUEST_IDLE_TTL) { unset($d['slots'][$n]); continue; }
+            if ($now - $ls > guest_slot_ttl($slot)) { unset($d['slots'][$n]); continue; }
             if (hash_equals((string) ($slot['token'] ?? ''), $token)) {
                 $d['slots'][$n]['last_seen'] = now_iso();
                 $owner   = (string) ($slot['owner'] ?? '');
                 $project = (string) ($slot['project'] ?? '');
                 $found = [
                     'n'       => (int) $n,
+                    'id'      => guest_agent_id((int) $n, $token),
                     'name'    => guest_slot_name((int) $n),
                     'owner'   => $owner,
                     'project' => $project,
@@ -913,7 +1132,7 @@ function guest_assign(): array {
         $now = time();
         foreach (array_keys($d['slots']) as $n) {
             $ls = strtotime($d['slots'][$n]['last_seen'] ?? '1970-01-01T00:00:00Z');
-            if ($now - $ls > GUEST_IDLE_TTL) unset($d['slots'][$n]);
+            if ($now - $ls > guest_slot_ttl($d['slots'][$n])) unset($d['slots'][$n]);
         }
         $elig = guest_eligible_projects();
         if (empty($elig)) return ['assigned' => false];

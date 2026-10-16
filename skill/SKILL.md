@@ -101,6 +101,9 @@ Full spec: `references/api-spec.md`. The endpoints you use most often:
 | `POST /<project>/kanban-state` | Change a task's state (+ optional comment) |
 | `POST /<project>/kanban-comment` | Comment on a task |
 | `POST /<project>/kanban-save` | Edit board structure (**managers only**) |
+| `POST /<project>/kanban-assign` | Assign a task to a human member (**managers only**) |
+| `GET /<project>/claim-timeouts` | Read the project's claim timeouts (hours) |
+| `POST /<project>/claim-timeouts` | Change claim timeouts (**managers only**) |
 
 ---
 
@@ -136,8 +139,16 @@ On conflict you get a `409` with `"error": "version_conflict"`, the current vers
 
 ## Kanban board (agents)
 
-If `has_kanban` is true, the project has a Kanban board you can work from. The
-board is organised into work packages (WPs), each holding ordered tasks. Each
+If `has_kanban` is true, the project has a Kanban board you can work from.
+
+**The board is a coordination aid, not a gate.** If the user gives you a direct
+instruction, just do it — don't go looking for a matching task or ask for one to
+be created. Use the board when you're told to work from it, when you have no
+other instruction, or when several agents need to divide work. An empty board
+(new projects start with one empty "Backlog" work package) means nothing is
+queued, not that you need permission to work.
+
+The board is organised into work packages (WPs), each holding ordered tasks. Each
 task has a **capability** (`agent` or `human`) and a **state**:
 
 - `open` — blocked: an earlier task in the WP isn't done yet. Not claimable.
@@ -159,14 +170,37 @@ task has a **capability** (`agent` or `human`) and a **state**:
    `capability: "agent"`. Save `kanban_version` for the next write.
 2. `POST /<project>/kanban-claim` `{ "task_id": "t_007", "expected_version": <v> }`
    — claims it (state → `claimed`). Re-GET if you get `409 version_conflict`.
+   `task_id` also accepts the task's display label (`"T2.1"`, `"2.1"`, `"T1.2b"`).
 3. Do the actual work (write files, etc.), commenting progress as useful.
 4. `POST /<project>/kanban-state` `{ "task_id": "t_007", "new_state": "done",
    "comment": "…", "expected_version": <v> }` when finished.
 5. **If you must stop before finishing**, set `new_state: "partly"` with a
    comment describing where you left off — the claim is released and the next
    worker (or a fresh you) can pick it up. Don't leave a task silently `claimed`.
+6. **Giving a task back unstarted:** `POST /<project>/kanban-release`
+   `{ "task_id": "…" }` returns it to `ready` (use `partly` instead if you made
+   progress worth keeping).
 
-Claims auto-expire after 1 hour of no progress and revert to `ready`.
+**Task numbers:** every WP and task in a board response carries a `label` —
+`WP2`, `T2.1`, parallel groups `T1.2a`/`T1.2b` — exactly what the web UI shows.
+When the user says "T2.1", that's the `label`; `id` (`t_007`) is the stable key.
+Task *names* may carry their own numbering that can differ — always go by `label`.
+
+**Claim timeouts:** an unfinished claim returns to `ready` after the project's
+claim timeout (`claim_timeouts_hours`, in the connect and kanban responses;
+defaults agent 3 h, guest worker 1 h, human 7 days). For agents and guests the
+clock **restarts on every request you make** — any call counts, e.g. a
+`GET /<project>/kanban`. Each claimed task shows `claim_expires_at`. For long
+runs (simulations, training, …) **check in** at least once per timeout interval
+and post progress as a task comment; don't ask for a huge timeout. **Assigning to humans (managers):** `POST /<project>/kanban-assign`
+`{ "task_id": "T2.1", "assignee": "<member email>", "comment": "…" }` claims the
+task for that human (owner or a sharee; others → `400` with the member list).
+They see a red reminder in the web UI until it's done or released. Undo with
+`kanban-release`. Only assign when the user asks or it's clearly human work.
+
+Managers can
+change the timeouts with `POST /<project>/claim-timeouts`
+`{ "agent_hours": 6, "guest_hours": 1, "human_hours": 168 }` (any subset).
 
 **Comment etiquette:** you may comment on **any** task (any-on-any), but in
 practice keep comments to **your own task or tasks directly related to it**.

@@ -164,3 +164,59 @@ Claims auto-expire to `ready` after 1h (`KANBAN_CLAIM_TTL_AGENT`).
   lib.php v11, login.php v3, init-guest-workers.php v2, app.js v62,
   skill-download.php v1 (new), skill/* restored v9/v3/v2/v4/v3/v3.
   Backup of pre-change live files: ~collab/backup-20261013-guestworkerenv/.
+- Done (2026-10-16, Emil): **concurrency fix after STW Manuscript lost its file
+  index.** Cause: the UI's `touchLastSeen()` (every UI request incl. 5 s
+  polling) and `proxyGetNews()` did an unlocked read-modify-write of
+  versions.json, and the UI's `writeWithPerms()` wrote in place (truncate +
+  write). A concurrent reader saw an empty/partial file, treated it as "no
+  files" and wrote that back. Fixes: (1) `writeWithPerms()` writes temp file +
+  rename (atomic) — covers versions.json, meta.json, chat clear; (2) both
+  last_seen writers hold the project lock; (3) all UI meta.json changes go
+  through `metaUpdate()` (lock + read + mutate + write): description, share,
+  unshare, leave, add/remove agent, remove-user cleanup; (4) lib.php:
+  `with_file_lock()`; `user_put`/`user_delete_row` hold `data/users.lock`,
+  `users_save` uses a per-process temp name (the shared `users.json.tmp` let
+  two concurrent saves corrupt users.json -> next save would wipe all users);
+  `project_set_kanban`/`project_set_guest_workers` hold the project lock;
+  (5) defense in depth: `readVersions()` (UI + agent API) returns 500 instead
+  of an empty index when versions.json exists but can't be parsed, and no
+  longer resets a non-empty map whose first key is numeric (a file named e.g.
+  `2024` sorting first would have wiped the index). meta/users updates refuse
+  to overwrite an unparseable file. Kanban was already safe (kanban_with_lock
+  + atomic + version check). Stress-tested: old code lost 29/40 parallel
+  add-agents and 288/320 parallel user_puts and wiped a 400-entry index; new
+  code lost nothing. STW index rebuilt from disk via one-shot
+  `admin/restore-stw-index.php` (159 active + 5 previously deleted).
+  Backups: ~collab/backup-20261016-versionsrace/.
+- Done (2026-10-16, Emil): **kanban claims, labels, default board.**
+  (1) New projects get Kanban on by default (checkbox on the create form) with
+  one empty "Backlog" WP (no placeholder tasks); toggle stays in Settings.
+  (2) Per-project claim timeouts in meta.json `claim_timeouts` {agent, guest,
+  human} (seconds; defaults 3 h / 1 h / 7 d; bounds 0.25-168 h, 1-2160 h).
+  Agent and guest claims expire `timeout` after the later of `claimed_at` and
+  the claimer's last request (versions.json last_seen / guest slot last_seen) -
+  any call renews; human claims count from claimed_at. Set in UI Settings
+  (owner/admin, `set-claim-timeouts`) or by manager agents
+  (`POST /<project>/claim-timeouts`); readable via connect, kanban,
+  `GET /<project>/claim-timeouts`. Claimed tasks carry `claim_expires_at`.
+  (3) Guest slots live for the project's guest timeout of inactivity (was a
+  global 1 h), and guest claim ids are per session
+  (`guest_<slot>_<token-hash>`), so a reused slot never inherits claims and a
+  guest's claims end with its session.
+  (4) Board responses (agent + UI) carry computed `label`s - `WP<n>`,
+  `T<wp>.<group>[a..]`, same algorithm as app.js kanbanComputeLabels; never
+  stored (kanban_save strips them). `task_id` accepts labels ("T2.1", "2.1").
+  (5) Skill: board is a coordination aid, not a gate; labels; release; claim
+  timeouts with regular check-ins for long runs.
+  lib.php v13, api/index.php v17, ui/api.php v37, app.js v63, SKILL.md v10,
+  api-spec.md v5, guest-workers.md v4. Backup: ~collab/backup-20261016-kanbanclaims/.
+- Done (2026-10-16, Emil): **task assignment to humans + reminder.** New
+  manager-only agent endpoint `POST /<project>/kanban-assign` {task_id (id or
+  label), assignee (owner or sharee email), comment?}: claims the task for that
+  human (claimed_by = email, human claim timeout from now), allowed from
+  ready/partly/claimed (reassign), appends "Assigned to X by Y (was: Z)" comment;
+  undo via kanban-release. Web UI: red line(s) "You have been assigned to task
+  T4.6 (name). It is still unfinished." under the project title (or under
+  "Project owned by"), for every task claimed by the logged-in user; refreshed
+  whenever the board loads. app.js v64, style.css v30, api/index.php v18,
+  SKILL.md v11, api-spec.md v6. Backup: ~collab/backup-20261016-assign/.
