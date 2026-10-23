@@ -820,6 +820,58 @@ body.auth-page {
     opacity: 0.85;
 }
 
+/* Footer strip of a card. With comments it is the hover target for the
+   comment popup, so it spans the card width down to the bottom edge. */
+.k-task-foot {
+    margin: 0.1rem -0.45rem -0.35rem;
+    padding: 0 0.45rem 0.35rem;
+    border-radius: 0 0 4px 4px;
+}
+.k-task-foot-has-comments {
+    cursor: help;
+}
+.k-task-foot-has-comments:hover {
+    background: rgba(0,0,0,0.07);
+}
+
+.k-comments-popup {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    width: max-content;
+    min-width: 220px;
+    max-width: min(440px, calc(100vw - 16px));
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 0.5rem 0.65rem;
+    background: var(--bg-card);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+    font-size: 0.8rem;
+    line-height: 1.35;
+}
+.k-comments-popup-head {
+    font-weight: 600;
+    color: var(--fg-muted);
+    font-size: 0.72rem;
+    margin-bottom: 0.3rem;
+}
+.k-comments-popup-item {
+    padding: 0.35rem 0;
+    border-top: 1px solid var(--border);
+}
+.k-comments-popup-meta {
+    font-size: 0.7rem;
+    color: var(--fg-muted);
+    margin-bottom: 0.15rem;
+}
+.k-comments-popup-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 /* --- State-driven visual treatment --------------------------------- */
 /* open / ready / claimed / partly / done. Background carries actor color
    from JS; we modulate it with filter so we don't have to know the hex. */

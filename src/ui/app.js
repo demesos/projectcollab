@@ -1990,6 +1990,11 @@ function kanbanTaskCard(task, label, userColors, isFirst) {
     makeEditable(nameDiv, task.name || '', (next) => kanbanRenameTask(task.id, next));
     card.appendChild(nameDiv);
 
+    // Footer strip: claimer, comment count and primary action live here.
+    // When the task has comments, hovering anywhere on the strip pops up
+    // the full comment thread (see attachKanbanCommentsPopup).
+    const foot = el('div', { class: 'k-task-foot' });
+
     // Claimer line (only when claimed/partly and we know who)
     if ((task.state === 'claimed' || task.state === 'partly') && task.claimed_by) {
         const claimedByMe = task.claimed_by === (window.CURRENT_USER && window.CURRENT_USER.email);
@@ -2012,14 +2017,13 @@ function kanbanTaskCard(task, label, userColors, isFirst) {
             display = nm;
             tip     = 'Claimed by ' + nm;
         }
-        card.appendChild(el('div', { class: 'k-task-claimer', title: tip },
+        foot.appendChild(el('div', { class: 'k-task-claimer', title: tip },
             '👤 ' + display));
     }
 
     // Comment indicator if any
     if (Array.isArray(task.comments) && task.comments.length > 0) {
-        card.appendChild(el('div', { class: 'k-task-comments',
-            title: task.comments.length + ' comment(s)' },
+        foot.appendChild(el('div', { class: 'k-task-comments' },
             '💬 ' + task.comments.length));
     }
 
@@ -2050,10 +2054,110 @@ function kanbanTaskCard(task, label, userColors, isFirst) {
             ev.stopPropagation();
             primaryAction.fn();
         });
-        card.appendChild(btn);
+        foot.appendChild(btn);
+    }
+
+    if (foot.childNodes.length > 0) {
+        if (Array.isArray(task.comments) && task.comments.length > 0) {
+            attachKanbanCommentsPopup(foot, task.comments);
+        }
+        card.appendChild(foot);
     }
 
     return card;
+}
+
+// --- Kanban comment hover popup -------------------------------------
+// One shared floating box, filled on hover of a card's footer strip.
+// Stays open while the pointer is over the box itself so long threads
+// can be scrolled; hides shortly after the pointer leaves both.
+let kanbanCommentsPopupEl = null;
+let kanbanCommentsPopupOwner = null;
+let kanbanCommentsPopupHideTimer = null;
+let kanbanCommentsPopupShowTimer = null;
+let kanbanCommentsPopupWatch = null;
+
+function kanbanCommentsPopup() {
+    if (kanbanCommentsPopupEl) return kanbanCommentsPopupEl;
+    const box = el('div', { class: 'k-comments-popup' });
+    box.addEventListener('mouseenter', () => clearTimeout(kanbanCommentsPopupHideTimer));
+    box.addEventListener('mouseleave', () => scheduleKanbanCommentsPopupHide());
+    document.body.appendChild(box);
+    // Position is fixed to the viewport, so drop it when the board scrolls
+    // (but not when the popup itself is scrolled) or a drag begins.
+    window.addEventListener('scroll', (ev) => {
+        if (ev.target !== box) hideKanbanCommentsPopup();
+    }, true);
+    document.addEventListener('dragstart', () => hideKanbanCommentsPopup(), true);
+    kanbanCommentsPopupEl = box;
+    return box;
+}
+
+function hideKanbanCommentsPopup() {
+    clearTimeout(kanbanCommentsPopupShowTimer);
+    clearTimeout(kanbanCommentsPopupHideTimer);
+    clearInterval(kanbanCommentsPopupWatch);
+    kanbanCommentsPopupOwner = null;
+    if (kanbanCommentsPopupEl) kanbanCommentsPopupEl.style.display = 'none';
+}
+
+function scheduleKanbanCommentsPopupHide() {
+    clearTimeout(kanbanCommentsPopupHideTimer);
+    kanbanCommentsPopupHideTimer = setTimeout(hideKanbanCommentsPopup, 200);
+}
+
+function attachKanbanCommentsPopup(foot, comments) {
+    foot.classList.add('k-task-foot-has-comments');
+    // Empty title suppresses the card's native description tooltip (and
+    // the children's) while the pointer is on the strip.
+    foot.setAttribute('title', '');
+    foot.querySelectorAll('[title]').forEach(n => n.removeAttribute('title'));
+
+    foot.addEventListener('mouseenter', () => {
+        clearTimeout(kanbanCommentsPopupHideTimer);
+        if (kanbanCommentsPopupOwner === foot) return;
+        // Short delay so sweeping the pointer across the board doesn't
+        // flash popups.
+        clearTimeout(kanbanCommentsPopupShowTimer);
+        kanbanCommentsPopupShowTimer = setTimeout(show, 500);
+    });
+    function show() {
+        if (!foot.isConnected) return;
+        const box = kanbanCommentsPopup();
+        box.replaceChildren(
+            el('div', { class: 'k-comments-popup-head' },
+                comments.length === 1 ? '1 comment' : comments.length + ' comments'),
+            ...comments.map(c => el('div', { class: 'k-comments-popup-item' },
+                el('div', { class: 'k-comments-popup-meta' },
+                    (c.by_name || c.by || '(unknown)') + ' · ' + fmtTime(c.at)),
+                el('div', { class: 'k-comments-popup-text' }, c.text || ''),
+            )),
+        );
+        box.style.display = 'block';
+        box.scrollTop = box.scrollHeight;   // newest comment in view
+
+        // Place below the strip; flip above if it would run off-screen.
+        const r = foot.getBoundingClientRect();
+        const bw = box.offsetWidth, bh = box.offsetHeight;
+        const left = Math.max(8, Math.min(r.left, window.innerWidth - bw - 8));
+        let top = r.bottom + 4;
+        if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - bh - 4);
+        box.style.left = left + 'px';
+        box.style.top  = top + 'px';
+
+        kanbanCommentsPopupOwner = foot;
+        // Board re-renders (polling, edits) can remove the strip without
+        // a mouseleave — drop the popup with it.
+        clearInterval(kanbanCommentsPopupWatch);
+        kanbanCommentsPopupWatch = setInterval(() => {
+            if (!foot.isConnected) hideKanbanCommentsPopup();
+        }, 500);
+    }
+    foot.addEventListener('mouseleave', () => {
+        clearTimeout(kanbanCommentsPopupShowTimer);
+        scheduleKanbanCommentsPopupHide();
+    });
+    foot.addEventListener('mousedown', () => hideKanbanCommentsPopup());
 }
 
 // --- Kanban structural edits (Phase 3.1: add only) ------------------

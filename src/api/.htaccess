@@ -1,15 +1,15 @@
-# All API requests get rewritten to index.php
-# Format: api/<project>/<endpoint...> → index.php?path=<project>/<endpoint...>
-
 RewriteEngine On
+RewriteBase /~collab/api/
 
-# Don't rewrite if the URL points to an existing file (e.g. for debugging)
+# Allow all HTTP methods (Apache blocks PUT/DELETE by default on some configs)
+<Limit GET POST PUT DELETE>
+    Require all granted
+</Limit>
+
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ index.php?path=$1 [QSA,L]
 
-# Send everything else to index.php
-RewriteRule ^(.*)$ index.php [QSA,L]
-
-# Make sure Apache passes the X-Agent-Secret header to PHP
-# (Some Apache configs strip non-standard headers by default)
 SetEnvIf X-Agent-Secret "(.*)" HTTP_X_AGENT_SECRET=$1
+SetEnvIf X-Expected-Version "(.*)" HTTP_X_EXPECTED_VERSION=$1
+SetEnvIf X-New-File "(.*)" HTTP_X_NEW_FILE=$1

@@ -665,7 +665,7 @@ function restoreBackup(array $user): void {
         // Determine target project name
         $targetName = ($rename !== '' && valid_project_slug($rename)) ? $rename : $extractedName;
         if (!valid_project_slug($targetName)) {
-            respond_json(400, ['error' => 'Invalid project name: ' . htmlspecialchars($targetName)]);
+            respond_json(400, ['error' => 'Invalid project name: ' . htmlspecialchars($targetName, ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML401)]);
         }
 
         $targetDir = project_dir($owner, $targetName);
