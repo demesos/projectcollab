@@ -1,0 +1,15 @@
+RewriteEngine On
+RewriteBase /~collab/api/
+
+# Allow all HTTP methods (Apache blocks PUT/DELETE by default on some configs)
+<Limit GET POST PUT DELETE>
+    Require all granted
+</Limit>
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ index.php?path=$1 [QSA,L]
+
+SetEnvIf X-Agent-Secret "(.*)" HTTP_X_AGENT_SECRET=$1
+SetEnvIf X-Expected-Version "(.*)" HTTP_X_EXPECTED_VERSION=$1
+SetEnvIf X-New-File "(.*)" HTTP_X_NEW_FILE=$1
